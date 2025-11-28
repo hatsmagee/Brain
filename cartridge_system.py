@@ -1059,13 +1059,19 @@ def list_carts(detailed: bool = False):
     carts = []
     for c in carts_snapshot:
         try:
+            avg_loss = None
+            if c.loss_count > 0:
+                loss_val = c.avg_loss
+                if np.isfinite(loss_val):
+                    avg_loss = round(loss_val, 3)
+            
             carts.append({
                 "id": c.id, 
                 "tokens": len(c.tokens), 
                 "created": c.created, 
                 "train_steps": c.steps, 
                 "strength": c.strength,
-                "avg_loss": round(c.avg_loss, 3) if c.loss_count > 0 else None
+                "avg_loss": avg_loss
             })
         except:
             pass
@@ -1170,12 +1176,22 @@ def debug_info():
     cart_info = []
     for c in carts_snapshot:
         try:
+            avg_loss = None
+            if c.loss_count > 0:
+                loss_val = c.avg_loss
+                if np.isfinite(loss_val):
+                    avg_loss = round(loss_val, 3)
+            
+            signal_norm = float(mx.linalg.norm(c.signal))
+            if not np.isfinite(signal_norm):
+                signal_norm = 0.0
+            
             cart_info.append({
                 "id": c.id,
                 "tokens": len(c.tokens),
                 "steps": c.steps,
-                "avg_loss": round(c.avg_loss, 3) if c.loss_count > 0 else None,
-                "signal_norm": float(mx.linalg.norm(c.signal))
+                "avg_loss": avg_loss,
+                "signal_norm": signal_norm
             })
         except:
             pass
