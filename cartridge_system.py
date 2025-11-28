@@ -1051,8 +1051,12 @@ def set_mode(mode: str):
 
 @app.websocket("/ws/chat")
 async def ws_chat(websocket: WebSocket):
-    await websocket.accept()
-    log.info("WebSocket connected")
+    try:
+        await websocket.accept()
+        log.info("WebSocket connected")
+    except Exception as e:
+        log.error(f"WebSocket accept failed: {e}")
+        return
     try:
         while True:
             data = await websocket.receive_json()
