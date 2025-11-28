@@ -105,6 +105,7 @@ class BatchTuner:
 
 
 TUNER = BatchTuner(initial=8, min_b=8, max_b=512)
+GPU_LOCK = threading.Lock()
 
 # =============================================================================
 # NEURAL PRIMITIVES
@@ -902,8 +903,9 @@ def training_loop():
             
             np_batch = np.array(batch, dtype=np.int32)
             
-            ENGINE.maybe_spawn(np_batch.flatten(), step)
-            loss, cid = ENGINE.train_step(np_batch)
+            with GPU_LOCK:
+                ENGINE.maybe_spawn(np_batch.flatten(), step)
+                loss, cid = ENGINE.train_step(np_batch)
             
             if not np.isfinite(loss):
                 continue
