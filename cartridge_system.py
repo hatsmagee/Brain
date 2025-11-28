@@ -196,8 +196,8 @@ class Cartridge:
         self.head = nn.Linear(CFG.dim, self.vocab_size, bias=False)
         
         # Convert to fp16
-        self.lora = self.lora.astype(mx.float16)
-        self.head = self.head.astype(mx.float16)
+        self.lora.set_dtype(mx.float16)
+        self.head.set_dtype(mx.float16)
         mx.eval(self.lora.parameters(), self.head.parameters(), self.signal)
     
     def encode(self, global_ids) -> mx.array:
@@ -324,7 +324,7 @@ class Router:
         self.signatures: Dict[str, mx.array] = {}
         self.strengths: Dict[str, float] = {}
         self.encoder = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, d))
-        self.encoder = self.encoder.astype(mx.float16)
+        self.encoder.set_dtype(mx.float16)
         mx.eval(self.encoder.parameters())
     
     def register(self, cart: Cartridge):
@@ -487,7 +487,7 @@ class Engine:
         
         # Stem (frozen backbone)
         self.stem = Stem(vocab=32000, d=CFG.dim, depth=CFG.stem_depth, heads=CFG.heads)
-        self.stem = self.stem.astype(mx.float16)
+        self.stem.set_dtype(mx.float16)
         mx.eval(self.stem.parameters())
         log.info("Stem initialized")
         
