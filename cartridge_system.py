@@ -729,6 +729,10 @@ def training_loop():
             step += 1
             tokens_done += CFG.batch * CFG.seq_len
             
+            # Update active cartridge immediately
+            with STATE.lock:
+                STATE.active_cart = cid
+            
             # Update metrics
             if step % 10 == 0:
                 now = time.time()
@@ -746,7 +750,7 @@ def training_loop():
                 with STATE.lock:
                     STATE.step = step
                     STATE.loss = float(loss)
-                    STATE.active_cart = cid
+                    # active_cart already updated above
                     STATE.num_carts = len(ENGINE.carts)
                     STATE.tok_per_sec = tps
                     STATE.vocab_size = len(ENGINE.registry.tokens)
