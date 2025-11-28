@@ -88,8 +88,8 @@ os.makedirs(CFG.library, exist_ok=True)
 
 class BatchTuner:
     """
-    Intelligent batch optimizer with 30-second moving average
-    and histogram tracking for stable, data-driven decisions.
+    Research-backed batch optimizer with exponential error decay,
+    adaptive volatility thresholds, and learning rate scaling.
     """
     def __init__(self, initial: int = 8, min_b: int = 8, max_b: int = 256):
         self.batch = initial
@@ -118,19 +118,50 @@ class BatchTuner:
         # Histogram/stats tracking
         self.tps_history = []  # Last 100 raw TPS values
         self.max_history = 100
-        self.volatility_threshold = 0.15  # 15% volatility limit
         
         # Confirmation system
         self.pending_change = None  # (batch_size, reason)
         self.confirmation_needed = 3  # Need 3 consistent readings
         self.confirmation_count = 0
         
-        # Growth parameters (moderate aggression)
-        self.stability_threshold = 10  # ~10 steps of stability
+        # Growth parameters (tuned per research)
+        self.stability_threshold = 15  # ~15 steps of stability (increased from 10)
         self.growth_factor = 1.15
-        self.improvement_threshold = 1.02  # 2% improvement
+        self.improvement_threshold = 1.02
         self.stability_count = 0  # Track stability
         
+        # NEW: Error memory decay (exponential backoff recovery)
+        self.error_memory_halflife = 50  # Steps to half the error "gravity"
+        self.error_memory_decay = 0.5 ** (1.0 / self.error_memory_halflife)
+        
+        # NEW: Adaptive volatility threshold
+        self.base_volatility_threshold = 0.10  # 10% base
+        self.current_volatility_threshold = self.base_volatility_threshold
+        
+        # NEW: Track original batch size for ratio calculations
+        self.original_batch = initial
+        
+    def _decay_error_memory(self):
+        """Gradually forget about old errors"""
+        if self.last_error_batch < 999999:  # If we have a real error memory
+            self.last_error_batch = 999999 - (
+                (999999 - self.last_error_batch) * self.error_memory_decay
+            )
+            # Prevent floating point precision issues
+            if self.last_error_batch > 999990:
+                self.last_error_batch = 999999
+    
+    def _update_volatility_threshold(self):
+        """Adapt volatility threshold based on training stage"""
+        # Early training: be stricter (lower volatility tolerance)
+        if self.stability_count < 30:
+            self.current_volatility_threshold = self.base_volatility_threshold * 0.7  # 7%
+        # Mature training: be more permissive
+        elif self.stability_count > 100:
+            self.current_volatility_threshold = self.base_volatility_threshold * 1.2  # 12%
+        else:
+            self.current_volatility_threshold = self.base_volatility_threshold  # 10%
+    
     def _clean_old_samples(self):
         """Remove samples older than window_seconds"""
         now = time.time()
@@ -182,6 +213,9 @@ class BatchTuner:
         if avg_tps == 0:
             return self.batch
         
+        # Update adaptive volatility threshold
+        self._update_volatility_threshold()
+        
         # Track best performance for current mode (using moving average)
         current_best_tps = self.best_tps_cpu if self.current_mode == 'cpu' else self.best_tps_gpu
         if avg_tps > current_best_tps * self.improvement_threshold:
@@ -201,8 +235,11 @@ class BatchTuner:
         else:
             self.stability_count += 1
         
+        # Decay error memory over time (allows eventual recovery)
+        self._decay_error_memory()
+        
         # Check if system is stable enough for a change
-        is_stable = volatility < self.volatility_threshold
+        is_stable = volatility < self.current_volatility_threshold
         is_stable_long = self.stability_count > self.stability_threshold
         
         # If stable, check for growth opportunity
@@ -213,14 +250,22 @@ class BatchTuner:
             if self.pending_change == new_batch:
                 self.confirmation_count += 1
                 if self.confirmation_count >= self.confirmation_needed:
-                    if new_batch < self.last_error_batch:
+                    # RESEARCH-BASED: Only block if extremely close to error, or if error is recent
+                    error_distance = new_batch - self.last_error_batch
+                    is_recent_error = self.stability_count < 20  # First 20 steps after error
+                    
+                    if abs(error_distance) < 5 and is_recent_error:
+                        # Too close and too recent, skip
+                        log.debug(f"⏸️  Skipping batch {new_batch} - too close to recent error {self.last_error_batch}")
+                        self.pending_change = None
+                        self.confirmation_count = 0
+                    else:
                         old_batch = self.batch
                         self.batch = new_batch
                         self.stability_count = 0
                         self.pending_change = None
                         self.confirmation_count = 0
-                        log.info(f"📊 BatchTuner: {old_batch} → {new_batch} "
-                               f"| Avg TPS: {avg_tps:.1f} | Vol: {volatility:.2%}")
+                        log.info(f"📊 BatchTuner: {old_batch} → {new_batch} | Avg TPS: {avg_tps:.1f} | Vol: {volatility:.2%}")
                         return self.batch
             else:
                 # Start new confirmation sequence
@@ -234,10 +279,12 @@ class BatchTuner:
         
         # Periodically log detailed statistics
         if len(self.tps_window) % 50 == 0 and len(self.tps_window) >= self.min_samples:
+            error_memory_age = min(self.stability_count, 100) / 100.0
             log.info(f"📊 BatchTuner: window={len(self.tps_window)} samples, "
-                     f"avg_tps={avg_tps:.1f}, vol={volatility:.1%}, "
+                     f"avg_tps={avg_tps:.1f}, vol={volatility:.2%} (threshold: {self.current_volatility_threshold:.2%}), "
                      f"stable={self.stability_count}, pending={self.pending_change}, "
-                     f"confirmations={self.confirmation_count}")
+                     f"confirmations={self.confirmation_count}, last_error={self.last_error_batch}, "
+                     f"error_memory={error_memory_age:.0%}")
         
         return self.batch
     
@@ -247,6 +294,7 @@ class BatchTuner:
         self.batch = max(self.min_b, self.batch // 2)
         self.error_count += 1
         self.last_error_batch = old_batch
+        self.stability_count = 0  # Reset stability counter on error
         
         # Reset confirmations
         self.pending_change = None
@@ -307,7 +355,9 @@ class BatchTuner:
             "pending_change": self.pending_change,
             "confirmations": self.confirmation_count,
             "volatility": round(self.get_volatility() * 100, 1),
-            "volatility_threshold": round(self.volatility_threshold * 100, 1)
+            "volatility_threshold": round(self.current_volatility_threshold * 100, 1),
+            "stability_count": self.stability_count,
+            "error_memory": round(999999 - self.last_error_batch, 0)  # How "fresh" is the error memory
         }
     
     def switch_mode(self, mode: str):
@@ -362,6 +412,8 @@ class BatchTuner:
             'max_b': self.max_b,
             'last_error_batch': self.last_error_batch,
             'error_count': self.error_count,
+            'stability_count': self.stability_count,  # NEW: Save stability
+            'original_batch': self.original_batch,
             'last_save': time.time()
         }
         
@@ -406,14 +458,16 @@ class BatchTuner:
                 self.best_batch = self.best_batch_gpu
                 self.best_tps = self.best_tps_gpu
             
-            # Restore other state
-            self.max_b = data.get('max_b', self.max_b)
+            # Restore error memory
             self.last_error_batch = data.get('last_error_batch', 999999)
             self.error_count = data.get('error_count', 0)
+            self.stability_count = data.get('stability_count', 0)
+            
+            # Restore other state
+            self.max_b = data.get('max_b', self.max_b)
             
             log.info(f"📂 BatchTuner loaded: batch={self.batch}, mode={self.current_mode}, "
-                    f"CPU best={self.best_batch_cpu}@{self.best_tps_cpu:.1f}, "
-                    f"GPU best={self.best_batch_gpu}@{self.best_tps_gpu:.1f}")
+                    f"stability={self.stability_count}, last_error={self.last_error_batch}")
         except Exception as e:
             log.warning(f"BatchTuner load failed: {e}, using defaults")
 
@@ -1456,6 +1510,9 @@ def training_loop():
             
             np_batch = np.array(batch, dtype=np.int32)
             
+            # Store batch size before training (for LR scaling detection)
+            old_batch_size = TUNER.batch
+            
             # GPU work with lock
             with GPU_LOCK:
                 ENGINE.maybe_spawn(np_batch.flatten(), step)
@@ -1472,9 +1529,19 @@ def training_loop():
             
             consecutive_errors = 0
             
-            # Update tuner
+            # Update tuner (may change batch size)
             step_time = time.time() - step_start
             TUNER.update(step_time)
+            
+            # NEW: Adjust learning rate if batch size changed (for next step)
+            if TUNER.batch != old_batch_size:
+                # Linear scaling rule: adjust LR proportionally to batch size change
+                batch_ratio = TUNER.batch / max(old_batch_size, 1)
+                CFG.lr = CFG.lr * batch_ratio  # Scale learning rate
+                # Clamp LR to reasonable bounds
+                CFG.lr = max(1e-5, min(1e-2, CFG.lr))
+                log.info(f"📈 Learning rate adjusted: {CFG.lr:.2e} (batch {old_batch_size} → {TUNER.batch}, ratio: {batch_ratio:.2f})")
+            
             step_start = time.time()
             
             step += 1
