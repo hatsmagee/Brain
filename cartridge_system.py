@@ -95,8 +95,18 @@ class BatchTuner:
         self.batch = initial
         self.min_b = min_b
         self.max_b = max_b
-        self.best_tps = 0.0
-        self.best_batch = initial
+        
+        # Separate tracking for CPU and GPU modes
+        self.best_batch_cpu = initial
+        self.best_tps_cpu = 0.0
+        self.best_batch_gpu = initial
+        self.best_tps_gpu = 0.0
+        
+        # Current mode tracking (will be set by mode switch)
+        self.current_mode = 'gpu'  # Default
+        self.best_batch = self.best_batch_gpu  # Current mode's best
+        self.best_tps = self.best_tps_gpu
+        
         self.error_count = 0
         self.last_error_batch = 999999
         
@@ -172,12 +182,22 @@ class BatchTuner:
         if avg_tps == 0:
             return self.batch
         
-        # Track best performance (using moving average)
-        if avg_tps > self.best_tps * self.improvement_threshold:
+        # Track best performance for current mode (using moving average)
+        current_best_tps = self.best_tps_cpu if self.current_mode == 'cpu' else self.best_tps_gpu
+        if avg_tps > current_best_tps * self.improvement_threshold:
+            # Update mode-specific best
+            if self.current_mode == 'cpu':
+                self.best_tps_cpu = avg_tps
+                self.best_batch_cpu = self.batch
+            else:
+                self.best_tps_gpu = avg_tps
+                self.best_batch_gpu = self.batch
+            
+            # Update current mode's best (for compatibility)
             self.best_tps = avg_tps
             self.best_batch = self.batch
             self.stability_count = 0
-            log.debug(f"📈 New best avg TPS: {avg_tps:.1f} (batch {self.batch})")
+            log.debug(f"📈 New best avg TPS ({self.current_mode.upper()}): {avg_tps:.1f} (batch {self.batch})")
         else:
             self.stability_count += 1
         
@@ -273,9 +293,14 @@ class BatchTuner:
         """Get detailed status for monitoring"""
         self._clean_old_samples()
         return {
-            "current": self.batch, 
-            "best": self.best_batch, 
+            "current": self.batch,
+            "current_mode": self.current_mode,
+            "best": self.best_batch,
             "best_tps": round(self.best_tps, 1),
+            "best_cpu": self.best_batch_cpu,
+            "best_tps_cpu": round(self.best_tps_cpu, 1),
+            "best_gpu": self.best_batch_gpu,
+            "best_tps_gpu": round(self.best_tps_gpu, 1),
             "max": self.max_b,
             "errors": self.error_count,
             "window_samples": len(self.tps_window),
@@ -285,6 +310,43 @@ class BatchTuner:
             "volatility_threshold": round(self.volatility_threshold * 100, 1)
         }
     
+    def switch_mode(self, mode: str):
+        """Switch between CPU and GPU modes, restoring appropriate batch size"""
+        if mode not in ['cpu', 'gpu']:
+            return
+        
+        old_mode = self.current_mode
+        self.current_mode = mode
+        
+        # Restore best batch size for the new mode
+        if mode == 'cpu':
+            best_for_mode = self.best_batch_cpu
+            best_tps_for_mode = self.best_tps_cpu
+        else:
+            best_for_mode = self.best_batch_gpu
+            best_tps_for_mode = self.best_tps_gpu
+        
+        # Update current references
+        self.best_batch = best_for_mode
+        self.best_tps = best_tps_for_mode
+        
+        # If we have a known good batch size for this mode, use it
+        # Otherwise keep current batch (might be exploring)
+        if best_for_mode > self.min_b:
+            # Use best known batch, but don't exceed max or go below min
+            self.batch = max(self.min_b, min(self.max_b, best_for_mode))
+            log.info(f"🔄 BatchTuner mode switch: {old_mode.upper()} → {mode.upper()} | "
+                    f"Batch: {self.batch} (best for {mode.upper()})")
+        else:
+            # No history for this mode, start fresh
+            log.info(f"🔄 BatchTuner mode switch: {old_mode.upper()} → {mode.upper()} | "
+                    f"Starting fresh (batch: {self.batch})")
+        
+        # Reset confirmation state on mode switch
+        self.pending_change = None
+        self.confirmation_count = 0
+        self.stability_count = 0
+    
     def save(self, path: str = None):
         """Persist tuner state to disk"""
         if path is None:
@@ -292,8 +354,11 @@ class BatchTuner:
         
         data = {
             'batch': self.batch,
-            'best_batch': self.best_batch,
-            'best_tps': self.best_tps,
+            'current_mode': self.current_mode,
+            'best_batch_cpu': self.best_batch_cpu,
+            'best_tps_cpu': self.best_tps_cpu,
+            'best_batch_gpu': self.best_batch_gpu,
+            'best_tps_gpu': self.best_tps_gpu,
             'max_b': self.max_b,
             'last_error_batch': self.last_error_batch,
             'error_count': self.error_count,
@@ -305,7 +370,8 @@ class BatchTuner:
             with open(tmp_path, 'w') as f:
                 json.dump(data, f)
             Path(tmp_path).replace(path)  # Atomic write
-            log.debug(f"💾 BatchTuner state saved: batch={self.batch}, best={self.best_batch}")
+            log.debug(f"💾 BatchTuner state saved: batch={self.batch}, mode={self.current_mode}, "
+                     f"CPU best={self.best_batch_cpu}, GPU best={self.best_batch_gpu}")
         except Exception as e:
             log.error(f"BatchTuner save failed: {e}")
     
@@ -322,16 +388,32 @@ class BatchTuner:
             with open(path) as f:
                 data = json.load(f)
             
-            # Restore critical state
+            # Restore mode-specific bests
+            self.best_batch_cpu = data.get('best_batch_cpu', self.best_batch_cpu)
+            self.best_tps_cpu = data.get('best_tps_cpu', 0.0)
+            self.best_batch_gpu = data.get('best_batch_gpu', self.best_batch_gpu)
+            self.best_tps_gpu = data.get('best_tps_gpu', 0.0)
+            
+            # Restore current mode and batch
+            self.current_mode = data.get('current_mode', 'gpu')
             self.batch = data.get('batch', self.batch)
-            self.best_batch = data.get('best_batch', self.best_batch)
-            self.best_tps = data.get('best_tps', 0.0)
+            
+            # Set current mode's best
+            if self.current_mode == 'cpu':
+                self.best_batch = self.best_batch_cpu
+                self.best_tps = self.best_tps_cpu
+            else:
+                self.best_batch = self.best_batch_gpu
+                self.best_tps = self.best_tps_gpu
+            
+            # Restore other state
             self.max_b = data.get('max_b', self.max_b)
             self.last_error_batch = data.get('last_error_batch', 999999)
             self.error_count = data.get('error_count', 0)
             
-            log.info(f"📂 BatchTuner loaded: batch={self.batch}, best={self.best_batch}, "
-                    f"best_tps={self.best_tps:.1f}, max={self.max_b}")
+            log.info(f"📂 BatchTuner loaded: batch={self.batch}, mode={self.current_mode}, "
+                    f"CPU best={self.best_batch_cpu}@{self.best_tps_cpu:.1f}, "
+                    f"GPU best={self.best_batch_gpu}@{self.best_tps_gpu:.1f}")
         except Exception as e:
             log.warning(f"BatchTuner load failed: {e}, using defaults")
 
@@ -1536,8 +1618,9 @@ async def lifespan(app: FastAPI):
     # Load BatchTuner state (must happen before engine initialization)
     TUNER.load()
     
-    # Set device mode from saved state
+    # Set device mode from saved state and sync tuner mode
     mx.set_default_device(mx.cpu if STATE.mode == 'cpu' else mx.gpu)
+    TUNER.switch_mode(STATE.mode)  # Ensure tuner is in sync with state
     
     # Initialize engine
     global ENGINE
@@ -1646,6 +1729,7 @@ def set_mode(mode: str):
     if mode in ['cpu', 'gpu']:
         STATE.mode = mode
         mx.set_default_device(mx.cpu if mode == 'cpu' else mx.gpu)
+        TUNER.switch_mode(mode)  # Switch tuner to new mode
         return {"mode": mode}
     return {"error": "Invalid mode"}
 
