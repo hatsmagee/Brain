@@ -9,7 +9,7 @@ Global workspace binds outputs. Hebbian learning strengthens successful pathways
 Optimized for Apple Silicon: cartridges fit in L2 cache for streaming inference.
 """
 
-import os, uuid, json, time, queue, asyncio, logging, threading, traceback, random
+import os, uuid, json, time, queue, asyncio, logging, threading, traceback, random, shutil
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, field
 from collections import defaultdict
@@ -367,10 +367,21 @@ class Cartridge:
         folder = Path(path) / uid
         if not folder.exists():
             return None
+        
+        meta_path = folder / 'meta.json'
         try:
-            with open(folder / 'meta.json') as f:
+            with open(meta_path) as f:
                 meta = json.load(f)
-            cart = cls(stem, set(meta['tokens']), uid)
+        except (json.JSONDecodeError, FileNotFoundError) as e:
+            log.warning(f"Corrupted cartridge {uid}, removing: {e}")
+            try:
+                shutil.rmtree(folder)
+            except Exception as rm_err:
+                log.error(f"Failed to remove {uid}: {rm_err}")
+            return None
+        
+        try:
+            cart = cls(stem, set(meta.get('tokens', [])), uid)
             cart.created = meta.get('created', time.time())
             cart.steps = meta.get('steps', 0)
             cart.strength = meta.get('strength', 1.0)
@@ -382,12 +393,6 @@ class Cartridge:
                 W = mx.load(str(wpath))
                 if 'signal' in W:
                     cart.signal = W['signal']
-                # Load lora and head weights too
-                lora_params = {k.replace('lora.', ''): v for k, v in W.items() if k.startswith('lora.')}
-                head_params = {k.replace('head.', ''): v for k, v in W.items() if k.startswith('head.')}
-                if lora_params:
-                    for (name, _), (_, val) in zip(tree_flatten(cart.lora.parameters()), lora_params.items()):
-                        pass  # Would need proper update logic
                 if 'head.weight' in W:
                     cart.head.weight = W['head.weight']
                 mx.eval(cart.signal, cart.head.weight)
