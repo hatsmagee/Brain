@@ -9,12 +9,13 @@ Global workspace binds outputs. Hebbian learning strengthens successful pathways
 Optimized for Apple Silicon: cartridges fit in L2 cache for streaming inference.
 """
 
-import os, uuid, json, time, queue, asyncio, logging, threading, traceback, random, shutil
+import os, uuid, json, time, queue, asyncio, logging, threading, traceback, random, shutil, re
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, field
 from collections import defaultdict
 from pathlib import Path
 from contextlib import asynccontextmanager
+import requests
 
 import numpy as np
 import mlx.core as mx
@@ -74,6 +75,12 @@ class Config:
     
     # Round-robin training to ensure all cartridges get trained
     round_robin_interval: int = 20  # Switch cartridge every N steps
+    
+    # Gutenberg downloader settings
+    gutenberg_enabled: bool = True
+    gutenberg_download_delay: int = 60  # seconds between downloads
+    gutenberg_max_books: int = 1000
+    gutenberg_min_length: int = 10000  # minimum characters to keep
 
 CFG = Config()
 os.makedirs(CFG.library, exist_ok=True)
@@ -671,6 +678,16 @@ class Engine:
         self.current_cart_idx: int = 0
         self.steps_on_current: int = 0
         
+        # Start Gutenberg downloader
+        global GUTENBERG_DOWNLOADER
+        if GUTENBERG_DOWNLOADER is None and CFG.gutenberg_enabled:
+            GUTENBERG_DOWNLOADER = GutenbergDownloader(
+                download_dir='./training_data/gutenberg',
+                max_books=CFG.gutenberg_max_books,
+                delay=CFG.gutenberg_download_delay
+            )
+            GUTENBERG_DOWNLOADER.start()
+        
         self._load()
         log.info(f"Engine ready: {len(self.carts)} cartridges, {len(self.registry.tokens)} tokens")
     
@@ -921,6 +938,141 @@ class State:
 
 STATE = State()
 ENGINE: Optional[Engine] = None
+GUTENBERG_DOWNLOADER = None
+
+
+# =============================================================================
+# GUTENBERG DOWNLOADER
+# =============================================================================
+
+class GutenbergDownloader:
+    """Background downloader for Project Gutenberg books"""
+    
+    def __init__(self, download_dir: str, max_books: int = 1000, delay: int = 60):
+        self.download_dir = Path(download_dir)
+        self.download_dir.mkdir(parents=True, exist_ok=True)
+        self.max_books = max_books
+        self.delay = delay
+        self.downloaded = self._load_downloaded()
+        self.lock = threading.Lock()
+        self.active = True
+        
+    def _load_downloaded(self) -> set:
+        """Load set of already downloaded book IDs"""
+        index_file = self.download_dir / 'downloaded.json'
+        if index_file.exists():
+            try:
+                with open(index_file) as f:
+                    return set(json.load(f))
+            except:
+                pass
+        return set()
+    
+    def _save_downloaded(self):
+        """Persist downloaded book IDs atomically"""
+        index_file = self.download_dir / 'downloaded.json'
+        tmp_file = index_file.with_suffix('.tmp')
+        with open(tmp_file, 'w') as f:
+            json.dump(list(self.downloaded), f)
+        tmp_file.replace(index_file)
+    
+    def _extract_content(self, text: str) -> str:
+        """Extract actual book content, remove Gutenberg boilerplate"""
+        # Look for standard markers
+        start_match = re.search(r'\*\*\* START OF.*?\*\*\*', text, re.IGNORECASE | re.DOTALL)
+        end_match = re.search(r'\*\*\* END OF.*?\*\*\*', text, re.IGNORECASE | re.DOTALL)
+        
+        if start_match and end_match:
+            content = text[start_match.end():end_match.start()]
+        else:
+            # Fallback: remove common header/footer patterns
+            lines = text.split('\n')
+            content_lines = []
+            in_content = False
+            
+            for line in lines:
+                if '*** START OF' in line or 'START OF THE PROJECT' in line:
+                    in_content = True
+                    continue
+                if '*** END OF' in line or 'END OF THE PROJECT' in line:
+                    break
+                if in_content:
+                    content_lines.append(line)
+            
+            content = '\n'.join(content_lines)
+        
+        # Clean up excessive whitespace
+        content = re.sub(r'\n\s*\n\s*\n', '\n\n', content)
+        return content.strip()
+    
+    def _download_book(self, book_id: int) -> bool:
+        """Download a single book by ID"""
+        try:
+            # Gutenberg mirror URL pattern
+            url = f"https://www.gutenberg.org/files/{book_id}/{book_id}-0.txt"
+            
+            response = requests.get(url, timeout=30)
+            if response.status_code != 200:
+                log.debug(f"Book {book_id} not found (status {response.status_code})")
+                return False
+            
+            content = self._extract_content(response.text)
+            
+            if len(content) < CFG.gutenberg_min_length:
+                log.debug(f"Book {book_id} too short ({len(content)} chars), skipping")
+                return False
+            
+            # Clean filename
+            filename = self.download_dir / f"gutenberg_{book_id:05d}.txt"
+            
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write(content)
+            
+            with self.lock:
+                self.downloaded.add(book_id)
+                self._save_downloaded()
+            
+            log.info(f"📚 Downloaded book {book_id} ({len(content):,} chars)")
+            return True
+            
+        except Exception as e:
+            log.warning(f"Failed to download book {book_id}: {e}")
+            return False
+    
+    def download_worker(self):
+        """Background worker thread - polite downloader"""
+        log.info(f"📖 Gutenberg downloader started (delay: {self.delay}s, max: {self.max_books})")
+        
+        while self.active and len(self.downloaded) < self.max_books:
+            try:
+                # Strategy: Random books in popular range (1000-70000)
+                book_id = random.randint(1000, 70000)
+                
+                if book_id in self.downloaded:
+                    continue
+                
+                success = self._download_book(book_id)
+                
+                if success:
+                    time.sleep(self.delay)  # Be polite
+                else:
+                    time.sleep(5)  # Wait before trying another ID
+                    
+            except Exception as e:
+                log.error(f"Downloader worker error: {e}")
+                time.sleep(10)
+        
+        log.info(f"📚 Downloader finished. Total books: {len(self.downloaded)}")
+    
+    def start(self):
+        """Start background download thread"""
+        if not CFG.gutenberg_enabled:
+            log.info("📚 Gutenberg downloader disabled")
+            return
+        
+        thread = threading.Thread(target=self.download_worker, daemon=True, name="GutenbergDownloader")
+        thread.start()
+        log.info("🚀 Gutenberg downloader thread started")
 
 
 # =============================================================================
@@ -951,27 +1103,40 @@ def data_gen():
         "The autonomic nervous system regulates involuntary functions.",
     ]
     
-    files = []
-    if os.path.exists('training_data'):
-        files = [os.path.join('training_data', f) for f in os.listdir('training_data') 
-                 if f.endswith('.txt')]
+    base_dir = Path('training_data')
+    gutenberg_dir = base_dir / 'gutenberg'
+    base_dir.mkdir(exist_ok=True)
+    gutenberg_dir.mkdir(exist_ok=True)
     
     fidx = 0
     while True:
+        # Build fresh file list periodically (to catch new downloads)
+        files = []
+        if base_dir.exists():
+            files.extend([base_dir / f for f in os.listdir(base_dir) if f.endswith('.txt') and not f.startswith('gutenberg_')])
+        
+        # Include gutenberg files
+        if gutenberg_dir.exists():
+            files.extend([gutenberg_dir / f for f in os.listdir(gutenberg_dir) if f.endswith('.txt')])
+        
         if files:
             try:
-                with open(files[fidx % len(files)], 'r', errors='ignore') as f:
+                file_path = files[fidx % len(files)]
+                with open(file_path, 'r', errors='ignore') as f:
                     text = f.read()
+                
                 if len(text) > 100:
+                    # Yield chunks to avoid overwhelming memory
                     for i in range(0, len(text), 3000):
                         yield text[i:i+3000]
                 else:
                     yield ' '.join(random.choices(sentences, k=random.randint(10, 30)))
             except Exception as e:
-                log.debug(f"Error reading file: {e}")
+                log.debug(f"Error reading file {file_path}: {e}")
                 yield ' '.join(random.choices(sentences, k=random.randint(10, 30)))
             fidx += 1
         else:
+            # No files yet, use sentences
             yield ' '.join(random.choices(sentences, k=random.randint(10, 30)))
 
 
@@ -1362,6 +1527,19 @@ def get_metrics():
 @app.get("/tuner")
 def get_tuner():
     return TUNER.status()
+
+
+@app.get("/gutenberg/count")
+def gutenberg_count():
+    if not CFG.gutenberg_enabled:
+        return {"total": 0, "enabled": False}
+    
+    gutenberg_dir = Path('training_data/gutenberg')
+    if not gutenberg_dir.exists():
+        return {"total": 0, "enabled": True}
+    
+    files = list(gutenberg_dir.glob("*.txt"))
+    return {"total": len(files), "enabled": True}
 
 
 @app.get("/debug")
