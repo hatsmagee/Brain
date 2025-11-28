@@ -66,6 +66,47 @@ class Config:
 CFG = Config()
 os.makedirs(CFG.library, exist_ok=True)
 
+
+class BatchTuner:
+    """PID-style batch optimizer - finds max throughput"""
+    
+    def __init__(self, initial: int = 8, min_b: int = 8, max_b: int = 512):
+        self.batch = initial
+        self.min_b = min_b
+        self.max_b = max_b
+        self.best_tps = 0.0
+        self.best_batch = initial
+        self.explore_cooldown = 0
+        self.direction = 1
+    
+    def update(self, step_time: float) -> int:
+        tps = (self.batch * CFG.seq_len) / max(step_time, 0.001)
+        
+        if tps > self.best_tps * 1.02:
+            self.best_tps = tps
+            self.best_batch = self.batch
+            self.explore_cooldown = 0
+        else:
+            self.explore_cooldown += 1
+        
+        if self.explore_cooldown < 15:
+            if self.direction == 1:
+                self.batch = min(self.max_b, int(self.batch * 1.3))
+            else:
+                self.batch = max(self.min_b, int(self.batch * 0.7))
+            if self.batch >= self.max_b or self.batch <= self.min_b:
+                self.direction *= -1
+        else:
+            self.batch = self.best_batch
+        
+        return self.batch
+    
+    def status(self) -> dict:
+        return {"current": self.batch, "best": self.best_batch, "best_tps": round(self.best_tps, 1)}
+
+
+TUNER = BatchTuner(initial=8, min_b=8, max_b=512)
+
 # =============================================================================
 # NEURAL PRIMITIVES
 # =============================================================================
@@ -823,6 +864,7 @@ def training_loop():
     step = 0
     tokens_done = 0
     t0 = time.time()
+    step_start = time.time()
     
     while True:
         try:
@@ -830,19 +872,21 @@ def training_loop():
                 time.sleep(0.05)
                 continue
             
-            target = CFG.batch * (CFG.seq_len + 1) * 2
+            batch_size = TUNER.batch
+            
+            target = batch_size * (CFG.seq_len + 1) * 2
             while len(buf) < target:
                 text = next(gen)
                 toks = ENGINE.registry.add(text)
                 buf.extend(toks)
             
-            if len(buf) < CFG.batch * (CFG.seq_len + 1):
+            if len(buf) < batch_size * (CFG.seq_len + 1):
                 time.sleep(0.01)
                 continue
             
             batch = []
             idx = 0
-            for _ in range(CFG.batch):
+            for _ in range(batch_size):
                 end = idx + CFG.seq_len + 1
                 if end > len(buf):
                     break
@@ -850,7 +894,7 @@ def training_loop():
                 idx += CFG.seq_len
             buf = buf[idx:]
             
-            if len(batch) < CFG.batch:
+            if len(batch) < batch_size:
                 continue
             
             np_batch = np.array(batch, dtype=np.int32)
@@ -861,8 +905,12 @@ def training_loop():
             if not np.isfinite(loss):
                 continue
             
+            step_time = time.time() - step_start
+            TUNER.update(step_time)
+            step_start = time.time()
+            
             step += 1
-            tokens_done += CFG.batch * CFG.seq_len
+            tokens_done += batch_size * CFG.seq_len
             
             # Track recent cartridges
             with STATE.lock:
@@ -893,7 +941,7 @@ def training_loop():
                     STATE.num_carts = len(ENGINE.carts)
                     STATE.tok_per_sec = tps
                     STATE.vocab_size = len(ENGINE.registry.tokens)
-                    STATE.batch_size = CFG.batch
+                    STATE.batch_size = TUNER.batch
                     STATE.memory_mb = mem_mb
                     STATE.memory_percent = mem_pct
                     STATE.cpu_percent = cpu_pct
@@ -1099,6 +1147,11 @@ async def ws_chat(websocket: WebSocket):
 @app.get("/metrics")
 def get_metrics():
     return STATE.metrics()
+
+
+@app.get("/tuner")
+def get_tuner():
+    return TUNER.status()
 
 
 @app.get("/debug")
