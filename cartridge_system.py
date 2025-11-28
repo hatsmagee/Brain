@@ -1050,26 +1050,30 @@ def list_carts(detailed: bool = False):
     if not ENGINE:
         return {"summary": {"total_cartridges": 0, "total_owned_tokens": 0}, "cartridges": []}
     
-    carts = []
-    for c in ENGINE.carts.values():
-        cart_info = {
-            "id": c.id, 
-            "tokens": len(c.tokens), 
-            "created": c.created, 
-            "train_steps": c.steps, 
-            "strength": c.strength,
-            "avg_loss": round(c.avg_loss, 3) if c.loss_count > 0 else None
-        }
-        carts.append(cart_info)
+    try:
+        # Copy to avoid iteration error
+        carts_snapshot = list(ENGINE.carts.values())
+    except RuntimeError:
+        return {"summary": {"total_cartridges": 0, "total_owned_tokens": 0}, "cartridges": [], "error": "retry"}
     
-    # Sort by steps (most trained first)
+    carts = []
+    for c in carts_snapshot:
+        try:
+            carts.append({
+                "id": c.id, 
+                "tokens": len(c.tokens), 
+                "created": c.created, 
+                "train_steps": c.steps, 
+                "strength": c.strength,
+                "avg_loss": round(c.avg_loss, 3) if c.loss_count > 0 else None
+            })
+        except:
+            pass
+    
     carts.sort(key=lambda x: -x['train_steps'])
     
     return {
-        "summary": {
-            "total_cartridges": len(carts), 
-            "total_owned_tokens": sum(c['tokens'] for c in carts)
-        },
+        "summary": {"total_cartridges": len(carts), "total_owned_tokens": sum(c['tokens'] for c in carts)},
         "cartridges": carts
     }
 
@@ -1158,21 +1162,29 @@ def debug_info():
     if not ENGINE:
         return {"error": "Engine not initialized"}
     
+    try:
+        carts_snapshot = list(ENGINE.carts.values())
+    except RuntimeError:
+        return {"error": "retry"}
+    
     cart_info = []
-    for c in ENGINE.carts.values():
-        cart_info.append({
-            "id": c.id,
-            "tokens": len(c.tokens),
-            "steps": c.steps,
-            "avg_loss": round(c.avg_loss, 3) if c.loss_count > 0 else None,
-            "signal_norm": float(mx.linalg.norm(c.signal))
-        })
+    for c in carts_snapshot:
+        try:
+            cart_info.append({
+                "id": c.id,
+                "tokens": len(c.tokens),
+                "steps": c.steps,
+                "avg_loss": round(c.avg_loss, 3) if c.loss_count > 0 else None,
+                "signal_norm": float(mx.linalg.norm(c.signal))
+            })
+        except:
+            pass
     
     return {
         "cartridges": cart_info,
         "vocab_size": len(ENGINE.registry.tokens),
-        "cart_order": ENGINE.cart_order,
-        "current_idx": ENGINE.current_cart_idx,
+        "cart_order": list(ENGINE.cart_order) if hasattr(ENGINE, 'cart_order') else [],
+        "current_idx": ENGINE.current_cart_idx if hasattr(ENGINE, 'current_cart_idx') else 0,
         "router_signatures": len(ENGINE.router.signatures)
     }
 
