@@ -177,6 +177,55 @@
         #tpsHistogram {
             transition: all 0.3s ease;
         }
+        
+        .tooltip {
+            position: fixed;
+            background: rgba(30, 41, 59, 0.95);
+            border: 1px solid var(--accent-blue);
+            border-radius: 8px;
+            padding: 12px 16px;
+            pointer-events: none;
+            z-index: 1000;
+            box-shadow: var(--shadow-lg);
+            backdrop-filter: blur(5px);
+            opacity: 0;
+            transition: opacity 0.2s ease;
+            font-size: 12px;
+            color: var(--text-primary);
+            max-width: 250px;
+        }
+        
+        .tooltip.show {
+            opacity: 1;
+        }
+        
+        .tooltip-title {
+            font-weight: 600;
+            color: var(--accent-blue);
+            margin-bottom: 4px;
+            font-family: monospace;
+            font-size: 13px;
+        }
+        
+        .tooltip-row {
+            display: flex;
+            justify-content: space-between;
+            gap: 16px;
+            margin: 2px 0;
+        }
+        
+        .tooltip-label {
+            color: var(--text-muted);
+        }
+        
+        .tooltip-value {
+            color: var(--text-primary);
+            font-weight: 500;
+        }
+        
+        canvas#cartridgeRadial {
+            cursor: crosshair;
+        }
     </style>
 </head>
 <body>
@@ -255,6 +304,11 @@
                 <div id="cartridgesList" class="cartridges-list loading">Loading...</div>
             </div>
         </div>
+    </div>
+
+    <div class="tooltip" id="tooltip">
+        <div class="tooltip-title" id="tooltipTitle"></div>
+        <div class="tooltip-content" id="tooltipContent"></div>
     </div>
 
     <script>
@@ -459,10 +513,15 @@
             const w = canvas.width, h = canvas.height;
             const cx = w/2, cy = h/2;
             
-            ctx.clearRect(0,0,w,h);
+            // Create radial gradient background
+            const bgGradient = ctx.createRadialGradient(cx, cy, 0, cx, cy, 350);
+            bgGradient.addColorStop(0, 'rgba(30, 41, 59, 0.3)');
+            bgGradient.addColorStop(1, 'rgba(15, 23, 42, 0.8)');
+            ctx.fillStyle = bgGradient;
+            ctx.fillRect(0, 0, w, h);
             
-            // Background circles
-            ctx.strokeStyle = '#334155';
+            // Draw subtle concentric guides (very faint)
+            ctx.strokeStyle = 'rgba(100, 116, 139, 0.1)';
             ctx.lineWidth = 1;
             [100, 200, 300].forEach(r => {
                 ctx.beginPath();
@@ -472,61 +531,168 @@
 
             if(!cartridges || cartridges.length === 0) {
                 ctx.fillStyle = '#64748b';
-                ctx.font = '14px sans-serif';
+                ctx.font = '16px sans-serif';
                 ctx.textAlign = 'center';
                 ctx.fillText('No cartridges yet', cx, cy);
                 return;
             }
 
-            const angleStep = (Math.PI*2) / cartridges.length;
+            // Calculate stats for normalization
             const maxTok = Math.max(...cartridges.map(c => c.tokens)) || 1;
             const maxSteps = Math.max(...cartridges.map(c => c.train_steps)) || 1;
+            const maxDist = 300; // Maximum distance from center
+            
+            // Store positions for hover detection
+            window.cartridgePositions = [];
 
             cartridges.forEach((c, i) => {
-                const angle = i * angleStep - Math.PI/2;
-                const len = 100 + (c.tokens / maxTok) * 200;
+                const angle = i * (Math.PI*2 / cartridges.length) - Math.PI/2;
+                const normalizedDist = 100 + (c.tokens / maxTok) * maxDist;
                 
-                const ex = cx + Math.cos(angle) * len;
-                const ey = cy + Math.sin(angle) * len;
+                const ex = cx + Math.cos(angle) * normalizedDist;
+                const ey = cy + Math.sin(angle) * normalizedDist;
 
-                // Color based on training progress
-                const hue = (c.train_steps / maxSteps) * 120; // Green = more trained
+                // Store position data for hover
+                window.cartridgePositions.push({
+                    x: ex, y: ey, data: c, angle: angle, distance: normalizedDist
+                });
+
+                // COLOR BY DISTANCE: Map 100-400px to hue 0-360°
+                const hue = ((normalizedDist - 100) / maxDist) * 360;
                 const isActive = c.id === currentActiveCart;
                 
-                ctx.strokeStyle = isActive ? '#10b981' : `hsl(${hue}, 70%, 50%)`;
-                ctx.lineWidth = isActive ? 3 : 2;
+                // Create radial gradient for 3D effect
+                const nodeRadius = isActive ? 8 : 5;
+                const gradient = ctx.createRadialGradient(ex, ey, 0, ex, ey, nodeRadius);
+                gradient.addColorStop(0, '#ffffff');
+                gradient.addColorStop(0.4, `hsl(${hue}, ${isActive ? '100%' : '70%'}, ${isActive ? '70%' : '50%'})`);
+                gradient.addColorStop(1, `hsl(${hue}, ${isActive ? '100%' : '70%'}, ${isActive ? '50%' : '40%'})`);
+                
+                // Draw connection line with distance-based fade
+                const lineOpacity = 0.3 + (normalizedDist / maxDist) * 0.4;
+                ctx.strokeStyle = `hsla(${hue}, 70%, 50%, ${lineOpacity})`;
+                ctx.lineWidth = isActive ? 3 : 1.5;
                 ctx.beginPath();
                 ctx.moveTo(cx, cy);
                 ctx.lineTo(ex, ey);
                 ctx.stroke();
-
-                // Node
-                ctx.fillStyle = isActive ? '#10b981' : `hsl(${hue}, 70%, 50%)`;
+                
+                // Draw node with glow for active
+                if (isActive) {
+                    ctx.shadowColor = '#10b981';
+                    ctx.shadowBlur = 15;
+                } else {
+                    ctx.shadowBlur = 0;
+                }
+                
+                ctx.fillStyle = gradient;
                 ctx.beginPath();
-                ctx.arc(ex, ey, isActive ? 8 : 5, 0, Math.PI*2);
+                ctx.arc(ex, ey, nodeRadius, 0, Math.PI*2);
                 ctx.fill();
-
-                // Label
-                ctx.fillStyle = '#e2e8f0';
-                ctx.font = '10px monospace';
-                ctx.textAlign = 'center';
-                ctx.fillText(c.id.substring(0, 4), ex, ey - 12);
+                
+                // Add subtle border
+                if (isActive) {
+                    ctx.strokeStyle = '#10b981';
+                    ctx.lineWidth = 2;
+                    ctx.stroke();
+                }
+                
+                // Reset shadow
+                ctx.shadowBlur = 0;
             });
             
-            // Center hub
-            ctx.fillStyle = '#1e293b';
+            // Draw center hub with glow
+            const hubGradient = ctx.createRadialGradient(cx, cy, 0, cx, cy, 30);
+            hubGradient.addColorStop(0, '#3b82f6');
+            hubGradient.addColorStop(1, '#1e293b');
+            ctx.fillStyle = hubGradient;
             ctx.beginPath();
             ctx.arc(cx, cy, 25, 0, Math.PI*2);
             ctx.fill();
+            
             ctx.strokeStyle = '#3b82f6';
             ctx.lineWidth = 3;
+            ctx.lineCap = 'round';
             ctx.stroke();
             
+            // Hub label
             ctx.fillStyle = '#e2e8f0';
             ctx.font = 'bold 12px sans-serif';
             ctx.textAlign = 'center';
             ctx.textBaseline = 'middle';
             ctx.fillText('STEM', cx, cy);
+        }
+        
+        // Add hover detection
+        function setupRadialHover() {
+            const canvas = document.getElementById('cartridgeRadial');
+            const tooltip = document.getElementById('tooltip');
+            
+            canvas.addEventListener('mousemove', (e) => {
+                const rect = canvas.getBoundingClientRect();
+                const x = e.clientX - rect.left;
+                const y = e.clientY - rect.top;
+                
+                let hovered = null;
+                let minDist = Infinity;
+                
+                // Find closest node
+                (window.cartridgePositions || []).forEach(pos => {
+                    const dx = x - pos.x;
+                    const dy = y - pos.y;
+                    const dist = Math.sqrt(dx*dx + dy*dy);
+                    
+                    if (dist < 12 && dist < minDist) { // 12px hover radius
+                        minDist = dist;
+                        hovered = pos;
+                    }
+                });
+                
+                if (hovered) {
+                    const c = hovered.data;
+                    const isActive = c.id === currentActiveCart;
+                    
+                    // Build tooltip content
+                    document.getElementById('tooltipTitle').textContent = 
+                        `${c.id} ${isActive ? ' (ACTIVE)' : ''}`;
+                    
+                    document.getElementById('tooltipContent').innerHTML = `
+                        <div class="tooltip-row">
+                            <span class="tooltip-label">Tokens:</span>
+                            <span class="tooltip-value">${c.tokens.toLocaleString()}</span>
+                        </div>
+                        <div class="tooltip-row">
+                            <span class="tooltip-label">Steps:</span>
+                            <span class="tooltip-value">${c.train_steps.toLocaleString()}</span>
+                        </div>
+                        <div class="tooltip-row">
+                            <span class="tooltip-label">Strength:</span>
+                            <span class="tooltip-value">${c.strength.toFixed(2)}</span>
+                        </div>
+                        <div class="tooltip-row">
+                            <span class="tooltip-label">Loss:</span>
+                            <span class="tooltip-value">${c.avg_loss !== null ? c.avg_loss.toFixed(3) : 'N/A'}</span>
+                        </div>
+                        <div class="tooltip-row">
+                            <span class="tooltip-label">Distance:</span>
+                            <span class="tooltip-value">${Math.round(hovered.distance)}px</span>
+                        </div>
+                    `;
+                    
+                    tooltip.style.left = (e.clientX + 10) + 'px';
+                    tooltip.style.top = (e.clientY - 40) + 'px';
+                    tooltip.classList.add('show');
+                    
+                    canvas.style.cursor = 'pointer';
+                } else {
+                    tooltip.classList.remove('show');
+                    canvas.style.cursor = 'crosshair';
+                }
+            });
+            
+            canvas.addEventListener('mouseleave', () => {
+                tooltip.classList.remove('show');
+            });
         }
 
         // Draw histogram in real-time
@@ -667,6 +833,7 @@
             startSSE();
             connectChat();
             refreshCartridges();
+            setupRadialHover(); // Add hover detection
             setInterval(refreshCartridges, 3000);
             setInterval(drawHistogram, 2000);
         };
