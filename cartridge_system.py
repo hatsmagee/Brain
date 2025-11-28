@@ -88,8 +88,8 @@ os.makedirs(CFG.library, exist_ok=True)
 
 class BatchTuner:
     """
-    Adaptive batch optimizer with moderate aggression.
-    Faster growth, clear logging, proper bounds checking.
+    Intelligent batch optimizer with 30-second moving average
+    and histogram tracking for stable, data-driven decisions.
     """
     def __init__(self, initial: int = 8, min_b: int = 8, max_b: int = 256):
         self.batch = initial
@@ -97,37 +97,127 @@ class BatchTuner:
         self.max_b = max_b
         self.best_tps = 0.0
         self.best_batch = initial
-        self.stable_count = 0
         self.error_count = 0
         self.last_error_batch = 999999
         
-        # Tunable parameters for aggression
-        self.stability_threshold = 10      # Steps before growth (was 20)
-        self.growth_factor = 1.15          # 15% growth (was 10%)
-        self.improvement_threshold = 1.02  # 2% improvement (was 5%)
+        # Time-based tracking (30-second window)
+        self.tps_window = []  # List of (timestamp, tps) tuples
+        self.window_seconds = 30
+        self.min_samples = 5  # Minimum measurements needed
         
+        # Histogram/stats tracking
+        self.tps_history = []  # Last 100 raw TPS values
+        self.max_history = 100
+        self.volatility_threshold = 0.15  # 15% volatility limit
+        
+        # Confirmation system
+        self.pending_change = None  # (batch_size, reason)
+        self.confirmation_needed = 3  # Need 3 consistent readings
+        self.confirmation_count = 0
+        
+        # Growth parameters (moderate aggression)
+        self.stability_threshold = 10  # ~10 steps of stability
+        self.growth_factor = 1.15
+        self.improvement_threshold = 1.02  # 2% improvement
+        self.stability_count = 0  # Track stability
+        
+    def _clean_old_samples(self):
+        """Remove samples older than window_seconds"""
+        now = time.time()
+        cutoff = now - self.window_seconds
+        self.tps_window = [(ts, val) for ts, val in self.tps_window if ts > cutoff]
+    
+    def get_moving_average_tps(self) -> float:
+        """Calculate TPS average over last 30 seconds"""
+        self._clean_old_samples()
+        
+        if len(self.tps_window) < self.min_samples:
+            return 0.0
+        
+        recent_tps = [val for _, val in self.tps_window]
+        return sum(recent_tps) / len(recent_tps)
+    
+    def get_volatility(self) -> float:
+        """Calculate coefficient of variation (volatility %)"""
+        self._clean_old_samples()
+        
+        if len(self.tps_window) < 2:
+            return 0.0
+        
+        recent_tps = [val for _, val in self.tps_window]
+        mean = sum(recent_tps) / len(recent_tps)
+        
+        if mean == 0:
+            return 0.0
+        
+        variance = sum((x - mean) ** 2 for x in recent_tps) / len(recent_tps)
+        std_dev = variance ** 0.5
+        return std_dev / mean  # Coefficient of variation
+    
     def update(self, step_time: float) -> int:
-        """Update batch size based on performance"""
+        """Update with time-based averaging and confirmation"""
+        now = time.time()
         tps = (self.batch * CFG.seq_len) / max(step_time, 0.001)
-        old_batch = self.batch
         
-        # Track best performance
-        if tps > self.best_tps * self.improvement_threshold:
-            self.best_tps = tps
+        # Store sample
+        self.tps_window.append((now, tps))
+        self.tps_history.append(tps)
+        self.tps_history = self.tps_history[-self.max_history:]
+        
+        # Get averaged metrics
+        avg_tps = self.get_moving_average_tps()
+        volatility = self.get_volatility()
+        
+        # Skip if insufficient data
+        if avg_tps == 0:
+            return self.batch
+        
+        # Track best performance (using moving average)
+        if avg_tps > self.best_tps * self.improvement_threshold:
+            self.best_tps = avg_tps
             self.best_batch = self.batch
-            self.stable_count = 0
-            log.debug(f"📈 New best TPS: {tps:.1f} (batch {self.batch})")
+            self.stability_count = 0
+            log.debug(f"📈 New best avg TPS: {avg_tps:.1f} (batch {self.batch})")
         else:
-            self.stable_count += 1
+            self.stability_count += 1
         
-        # Growth logic with proper bounds
-        if self.stable_count > self.stability_threshold and self.batch < self.max_b:
+        # Check if system is stable enough for a change
+        is_stable = volatility < self.volatility_threshold
+        is_stable_long = self.stability_count > self.stability_threshold
+        
+        # If stable, check for growth opportunity
+        if is_stable and is_stable_long and self.batch < self.max_b:
             new_batch = min(self.max_b, int(self.batch * self.growth_factor))
-            if new_batch < self.last_error_batch:
-                if new_batch != self.batch:  # Only log on change
-                    log.info(f"📊 BatchTuner: {self.batch} → {new_batch} | TPS: {tps:.1f}")
-                self.batch = new_batch
-                self.stable_count = 0
+            
+            # Check confirmation
+            if self.pending_change == new_batch:
+                self.confirmation_count += 1
+                if self.confirmation_count >= self.confirmation_needed:
+                    if new_batch < self.last_error_batch:
+                        old_batch = self.batch
+                        self.batch = new_batch
+                        self.stability_count = 0
+                        self.pending_change = None
+                        self.confirmation_count = 0
+                        log.info(f"📊 BatchTuner: {old_batch} → {new_batch} "
+                               f"| Avg TPS: {avg_tps:.1f} | Vol: {volatility:.2%}")
+                        return self.batch
+            else:
+                # Start new confirmation sequence
+                self.pending_change = new_batch
+                self.confirmation_count = 1
+                log.debug(f"📊 Considering batch {new_batch} (need {self.confirmation_needed} confirmations)")
+        else:
+            # Reset if conditions aren't met
+            self.pending_change = None
+            self.confirmation_count = 0
+        
+        # Periodically log detailed statistics
+        if len(self.tps_window) % 50 == 0 and len(self.tps_window) >= self.min_samples:
+            log.info(f"📊 BatchTuner: window={len(self.tps_window)} samples, "
+                     f"avg_tps={avg_tps:.1f}, vol={volatility:.1%}, "
+                     f"stable={self.stability_count}, pending={self.pending_change}, "
+                     f"confirmations={self.confirmation_count}")
         
         return self.batch
     
@@ -136,21 +226,63 @@ class BatchTuner:
         old_batch = self.batch
         self.batch = max(self.min_b, self.batch // 2)
         self.error_count += 1
-        self.max_b = min(self.max_b, self.last_error_batch - 8)
         self.last_error_batch = old_batch
+        
+        # Reset confirmations
+        self.pending_change = None
+        self.confirmation_count = 0
         
         log.warning(f"⚠️  BatchTuner: {old_batch} → {self.batch} (error) | Max: {self.max_b}")
         return self.batch
     
+    def get_histogram(self, bins: int = 10) -> dict:
+        """Return TPS histogram data for visualization"""
+        if not self.tps_history:
+            return {"bins": [], "counts": [], "current": 0, "best": 0, "mean": 0}
+        
+        # Calculate bins
+        min_tps = min(self.tps_history)
+        max_tps = max(self.tps_history)
+        
+        if max_tps == min_tps:
+            return {
+                "bins": [min_tps],
+                "counts": [len(self.tps_history)],
+                "current": self.batch,
+                "best": self.best_batch,
+                "mean": min_tps
+            }
+        
+        bin_width = (max_tps - min_tps) / bins
+        hist_counts = [0] * bins
+        
+        for tps in self.tps_history:
+            bin_idx = min(int((tps - min_tps) / bin_width), bins - 1)
+            hist_counts[bin_idx] += 1
+        
+        return {
+            "bins": [min_tps + (i + 0.5) * bin_width for i in range(bins)],
+            "counts": hist_counts,
+            "current": self.batch,
+            "best": self.best_batch,
+            "mean": sum(self.tps_history) / len(self.tps_history),
+            "volatility": self.get_volatility()
+        }
+    
     def status(self) -> dict:
-        """Get current status for monitoring"""
+        """Get detailed status for monitoring"""
+        self._clean_old_samples()
         return {
             "current": self.batch, 
             "best": self.best_batch, 
             "best_tps": round(self.best_tps, 1),
             "max": self.max_b,
             "errors": self.error_count,
-            "stable_steps": self.stable_count
+            "window_samples": len(self.tps_window),
+            "pending_change": self.pending_change,
+            "confirmations": self.confirmation_count,
+            "volatility": round(self.get_volatility() * 100, 1),
+            "volatility_threshold": round(self.volatility_threshold * 100, 1)
         }
 
 
@@ -1527,6 +1659,12 @@ def get_metrics():
 @app.get("/tuner")
 def get_tuner():
     return TUNER.status()
+
+
+@app.get("/tuner/histogram")
+def get_tuner_histogram():
+    """Get TPS histogram data for UI visualization"""
+    return TUNER.get_histogram(bins=10)
 
 
 @app.get("/gutenberg/count")

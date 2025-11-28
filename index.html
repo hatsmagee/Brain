@@ -172,6 +172,11 @@
             background: var(--accent-green);
             color: white;
         }
+        
+        /* Add smooth bar transitions */
+        #tpsHistogram {
+            transition: all 0.3s ease;
+        }
     </style>
 </head>
 <body>
@@ -201,6 +206,15 @@
 
             <div class="card">
                 <h2>⚡ Performance</h2>
+                
+                <!-- New histogram canvas -->
+                <canvas id="tpsHistogram" width="300" height="100" 
+                        style="background: var(--bg-primary); border-radius: 8px; margin: 10px 0;"></canvas>
+                
+                <!-- Tuner status -->
+                <div id="tunerStatus"></div>
+                
+                <!-- Existing metrics -->
                 <div id="performanceMetrics" class="loading">Waiting for stream...</div>
             </div>
 
@@ -515,11 +529,86 @@
             ctx.fillText('STEM', cx, cy);
         }
 
+        // Draw histogram in real-time
+        async function drawHistogram() {
+            try {
+                const data = await fetch(`${API_BASE}/tuner/histogram`).then(r => r.json());
+                const canvas = document.getElementById('tpsHistogram');
+                if (!canvas) return;
+                
+                const ctx = canvas.getContext('2d');
+                const w = canvas.width, h = canvas.height;
+                
+                ctx.clearRect(0, 0, w, h);
+                
+                if (!data.counts || data.counts.length === 0) return;
+                
+                // Draw bars
+                const maxCount = Math.max(...data.counts, 1);
+                const barWidth = w / data.counts.length;
+                
+                data.counts.forEach((count, i) => {
+                    const height = (count / maxCount) * (h - 15);
+                    const x = i * barWidth + 1;
+                    const y = h - height;
+                    
+                    // Color based on bin position relative to mean
+                    const isAboveMean = data.bins[i] > data.mean;
+                    ctx.fillStyle = isAboveMean ? '#10b981' : '#3b82f6';
+                    ctx.fillRect(x, y, barWidth - 2, height);
+                });
+                
+                // Draw mean line
+                if (data.mean > 0 && data.bins.length > 0) {
+                    const minBin = Math.min(...data.bins);
+                    const maxBin = Math.max(...data.bins);
+                    if (maxBin > minBin) {
+                        const meanX = ((data.mean - minBin) / (maxBin - minBin)) * w;
+                        ctx.strokeStyle = '#f59e0b';
+                        ctx.lineWidth = 2;
+                        ctx.setLineDash([5, 5]);
+                        ctx.beginPath();
+                        ctx.moveTo(meanX, 0);
+                        ctx.lineTo(meanX, h);
+                        ctx.stroke();
+                        ctx.setLineDash([]);
+                    }
+                }
+                
+                // Update status
+                const statusHtml = `
+                    <div class="metric">
+                        <span class="metric-label">Current Batch</span>
+                        <span class="metric-value">${data.current}</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Best Batch</span>
+                        <span class="metric-value">${data.best}</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Mean TPS</span>
+                        <span class="metric-value">${data.mean.toFixed(1)}</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Volatility</span>
+                        <span class="metric-value" style="color: ${data.volatility > 0.15 ? '#ef4444' : '#10b981'}">
+                            ${(data.volatility * 100).toFixed(1)}%
+                        </span>
+                    </div>
+                `;
+                document.getElementById('tunerStatus').innerHTML = statusHtml;
+                
+            } catch(e) {
+                console.error("Histogram error:", e);
+            }
+        }
+
         window.onload = () => {
             startSSE();
             connectChat();
             refreshCartridges();
             setInterval(refreshCartridges, 3000);
+            setInterval(drawHistogram, 2000);
         };
     </script>
 </body>
