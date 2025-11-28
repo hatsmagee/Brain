@@ -14,6 +14,7 @@ from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, field
 from collections import defaultdict
 from pathlib import Path
+from contextlib import asynccontextmanager
 
 import numpy as np
 import mlx.core as mx
@@ -34,6 +35,16 @@ from sse_starlette.sse import EventSourceResponse
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 log = logging.getLogger(__name__)
+
+# Hard requirement with clear error
+try:
+    import websockets
+    import sse_starlette
+except ImportError as e:
+    log.critical("❌ MISSING REQUIRED PACKAGES")
+    log.critical("   Install with: pip install websockets sse-starlette")
+    log.critical(f"   Error: {e}")
+    raise RuntimeError("Missing critical dependencies")
 
 # =============================================================================
 # CONFIGURATION
@@ -56,6 +67,7 @@ class Config:
     lr: float = 3e-4
     
     library: str = './cartridge_library'
+    state_file: str = './cartridge_library/state.json'
     spawn_interval: int = 50        # More frequent spawn checks
     spawn_min_tokens: int = 30      # Lower threshold for spawning
     save_interval: int = 2000
@@ -68,43 +80,74 @@ os.makedirs(CFG.library, exist_ok=True)
 
 
 class BatchTuner:
-    """PID-style batch optimizer - finds max throughput"""
-    def __init__(self, initial: int = 8, min_b: int = 8, max_b: int = 512):
+    """
+    Adaptive batch optimizer with moderate aggression.
+    Faster growth, clear logging, proper bounds checking.
+    """
+    def __init__(self, initial: int = 8, min_b: int = 8, max_b: int = 256):
         self.batch = initial
         self.min_b = min_b
         self.max_b = max_b
         self.best_tps = 0.0
         self.best_batch = initial
-        self.explore_cooldown = 0
-        self.direction = 1
-
-    def update(self, step_time: float) -> int:
-        tps = (self.batch * CFG.seq_len) / max(step_time, 0.001)
+        self.stable_count = 0
+        self.error_count = 0
+        self.last_error_batch = 999999
         
-        if tps > self.best_tps * 1.02:
+        # Tunable parameters for aggression
+        self.stability_threshold = 10      # Steps before growth (was 20)
+        self.growth_factor = 1.15          # 15% growth (was 10%)
+        self.improvement_threshold = 1.02  # 2% improvement (was 5%)
+        
+    def update(self, step_time: float) -> int:
+        """Update batch size based on performance"""
+        tps = (self.batch * CFG.seq_len) / max(step_time, 0.001)
+        old_batch = self.batch
+        
+        # Track best performance
+        if tps > self.best_tps * self.improvement_threshold:
             self.best_tps = tps
             self.best_batch = self.batch
-            self.explore_cooldown = 0
+            self.stable_count = 0
+            log.debug(f"📈 New best TPS: {tps:.1f} (batch {self.batch})")
         else:
-            self.explore_cooldown += 1
+            self.stable_count += 1
         
-        if self.explore_cooldown < 15:
-            if self.direction == 1:
-                self.batch = min(self.max_b, int(self.batch * 1.3))
-            else:
-                self.batch = max(self.min_b, int(self.batch * 0.7))
-            if self.batch >= self.max_b or self.batch <= self.min_b:
-                self.direction *= -1
-        else:
-            self.batch = self.best_batch
+        # Growth logic with proper bounds
+        if self.stable_count > self.stability_threshold and self.batch < self.max_b:
+            new_batch = min(self.max_b, int(self.batch * self.growth_factor))
+            if new_batch < self.last_error_batch:
+                if new_batch != self.batch:  # Only log on change
+                    log.info(f"📊 BatchTuner: {self.batch} → {new_batch} | TPS: {tps:.1f}")
+                self.batch = new_batch
+                self.stable_count = 0
         
         return self.batch
-
+    
+    def on_error(self) -> int:
+        """Handle OOM or compute errors"""
+        old_batch = self.batch
+        self.batch = max(self.min_b, self.batch // 2)
+        self.error_count += 1
+        self.max_b = min(self.max_b, self.last_error_batch - 8)
+        self.last_error_batch = old_batch
+        
+        log.warning(f"⚠️  BatchTuner: {old_batch} → {self.batch} (error) | Max: {self.max_b}")
+        return self.batch
+    
     def status(self) -> dict:
-        return {"current": self.batch, "best": self.best_batch, "best_tps": round(self.best_tps, 1)}
+        """Get current status for monitoring"""
+        return {
+            "current": self.batch, 
+            "best": self.best_batch, 
+            "best_tps": round(self.best_tps, 1),
+            "max": self.max_b,
+            "errors": self.error_count,
+            "stable_steps": self.stable_count
+        }
 
 
-TUNER = BatchTuner(initial=8, min_b=8, max_b=512)
+TUNER = BatchTuner(initial=8, min_b=8, max_b=256)
 GPU_LOCK = threading.Lock()
 
 # =============================================================================
@@ -195,7 +238,7 @@ class LoRA(nn.Module):
 class Cartridge:
     __slots__ = ('id', 'stem', 'tokens', 'vocab_size', 'local_to_global', 'global_to_local',
                  '_lookup', 'lora', 'signal', 'head', 'created', 'last_used', 'steps', 
-                 'strength', 'total_loss', 'loss_count')
+                 'strength', 'total_loss', 'loss_count', '_lock')
     
     def __init__(self, stem: Stem, tokens: set = None, uid: str = None):
         self.id = uid or uuid.uuid4().hex[:8]
@@ -207,6 +250,7 @@ class Cartridge:
         self.strength = 1.0
         self.total_loss = 0.0
         self.loss_count = 0
+        self._lock = threading.Lock()
         
         # Build vocab mapping
         self.local_to_global = [0, 1] + sorted(self.tokens)
@@ -234,39 +278,48 @@ class Cartridge:
         return self.total_loss / max(1, self.loss_count)
     
     def add_tokens(self, new_tokens: set):
-        """Expand vocabulary with new tokens"""
-        added = new_tokens - self.tokens
-        if not added:
+        """Thread-safe token addition with atomic weight matrix expansion"""
+        if not new_tokens:
             return
         
-        self.tokens.update(added)
-        old_vocab_size = self.vocab_size
-        
-        # Rebuild mapping
-        self.local_to_global = [0, 1] + sorted(self.tokens)
-        self.global_to_local = {g: i for i, g in enumerate(self.local_to_global)}
-        self.vocab_size = len(self.local_to_global)
-        
-        # Extend lookup
-        maxg = max(self.local_to_global)
-        if maxg >= len(self._lookup):
-            new_lookup = np.ones(maxg + 1000, dtype=np.int32)
-            new_lookup[:len(self._lookup)] = self._lookup
-            self._lookup = new_lookup
-        for g, l in self.global_to_local.items():
-            self._lookup[g] = l
-        
-        # Expand head if needed
-        if self.vocab_size > old_vocab_size:
+        with self._lock:
+            added = new_tokens - self.tokens
+            if not added:
+                return
+            
+            self.tokens.update(added)
+            
+            # CRITICAL: Capture current weight matrix ATOMICALLY
             old_weight = self.head.weight
-            new_weight = mx.zeros((self.vocab_size, CFG.dim), dtype=mx.float16)
-            new_weight[:old_vocab_size, :] = old_weight
-            # Initialize new weights with small random values
-            new_weight[old_vocab_size:, :] = mx.random.normal(
-                (self.vocab_size - old_vocab_size, CFG.dim), dtype=mx.float16
-            ) * 0.02
-            self.head.weight = new_weight
-            mx.eval(self.head.weight)
+            actual_old_size = old_weight.shape[0]  # Use REAL shape, not cached value
+            
+            # Rebuild mappings
+            self.local_to_global = [0, 1] + sorted(self.tokens)
+            self.global_to_local = {g: i for i, g in enumerate(self.local_to_global)}
+            self.vocab_size = len(self.local_to_global)
+            
+            # Extend lookup table
+            maxg = max(self.local_to_global)
+            if maxg >= len(self._lookup):
+                new_lookup = np.ones(maxg + 1000, dtype=np.int32)
+                new_lookup[:len(self._lookup)] = self._lookup
+                self._lookup = new_lookup
+            for g, l in self.global_to_local.items():
+                self._lookup[g] = l
+            
+            # Expand head if needed
+            if self.vocab_size > actual_old_size:
+                # Use actual_old_size from the captured weight matrix
+                new_weight = mx.zeros((self.vocab_size, CFG.dim), dtype=mx.float16)
+                new_weight[:actual_old_size, :] = old_weight  # Now guaranteed to match
+                
+                # Initialize new weights
+                new_weight[actual_old_size:, :] = mx.random.normal(
+                    (self.vocab_size - actual_old_size, CFG.dim), dtype=mx.float16
+                ) * 0.02
+                
+                self.head.weight = new_weight
+                mx.eval(self.head.weight)
     
     def encode(self, global_ids) -> mx.array:
         arr = np.asarray(global_ids, dtype=np.int32)
@@ -299,17 +352,19 @@ class Cartridge:
             logits = head(h)
             return nn.losses.cross_entropy(logits, y).mean()
         
-        loss, grads = mx.value_and_grad(loss_fn, argnums=(0, 1, 2))(self.lora, self.head, self.signal)
-        
-        lr = CFG.lr
-        for (_, p), (_, g) in zip(tree_flatten(self.lora.parameters()), tree_flatten(grads[0])):
-            p -= lr * g
-        for (_, p), (_, g) in zip(tree_flatten(self.head.parameters()), tree_flatten(grads[1])):
-            p -= lr * g
-        self.signal -= lr * grads[2]
-        
-        mx.eval(self.lora.parameters(), self.head.parameters(), self.signal)
-        self.steps += 1
+        # Acquire lock during gradient computation
+        with self._lock:
+            loss, grads = mx.value_and_grad(loss_fn, argnums=(0, 1, 2))(self.lora, self.head, self.signal)
+            
+            lr = CFG.lr
+            for (_, p), (_, g) in zip(tree_flatten(self.lora.parameters()), tree_flatten(grads[0])):
+                p -= lr * g
+            for (_, p), (_, g) in zip(tree_flatten(self.head.parameters()), tree_flatten(grads[1])):
+                p -= lr * g
+            self.signal -= lr * grads[2]
+            
+            mx.eval(self.lora.parameters(), self.head.parameters(), self.signal)
+            self.steps += 1
         
         loss_val = float(loss)
         self.total_loss += loss_val
@@ -345,6 +400,7 @@ class Cartridge:
         folder = Path(path) / self.id
         folder.mkdir(parents=True, exist_ok=True)
         
+        # Save weights
         params = {'signal': self.signal}
         for k, v in tree_flatten(self.lora.parameters()):
             params[f'lora.{k}'] = v
@@ -352,16 +408,31 @@ class Cartridge:
             params[f'head.{k}'] = v
         mx.save_safetensors(str(folder / 'weights.safetensors'), params)
         
-        with open(folder / 'meta.json', 'w') as f:
-            json.dump({
-                'id': self.id, 
-                'tokens': list(self.tokens), 
-                'created': self.created,
-                'steps': self.steps, 
-                'strength': self.strength,
-                'total_loss': self.total_loss,
-                'loss_count': self.loss_count
-            }, f)
+        # Atomic JSON write - write to temp then rename
+        # FIX: Convert tokens to Python int (numpy int32 is not JSON serializable)
+        # Convert all tokens to native Python int using recommended approach
+        token_list = []
+        for t in self.tokens:
+            # Convert numpy integers to Python int (recommended approach)
+            if isinstance(t, np.integer):
+                token_list.append(int(t))
+            else:
+                token_list.append(int(t))
+        
+        meta = {
+            'id': self.id, 
+            'tokens': token_list, 
+            'created': self.created,
+            'steps': self.steps, 
+            'strength': self.strength,
+            'total_loss': self.total_loss,
+            'loss_count': self.loss_count
+        }
+        tmp_path = folder / 'meta.json.tmp'
+        final_path = folder / 'meta.json'
+        with open(tmp_path, 'w') as f:
+            json.dump(meta, f)
+        tmp_path.replace(final_path)  # Atomic on POSIX
     
     @classmethod
     def load(cls, uid: str, stem: Stem, path: str) -> Optional['Cartridge']:
@@ -609,6 +680,7 @@ class Engine:
             self.registry.load(reg_path)
         
         if os.path.exists(CFG.library):
+            total_steps = 0  # Track total loaded steps
             for uid in os.listdir(CFG.library):
                 p = os.path.join(CFG.library, uid)
                 if os.path.isdir(p):
@@ -617,6 +689,9 @@ class Engine:
                         self.carts[cart.id] = cart
                         self.router.register(cart)
                         self.cart_order.append(cart.id)
+                        total_steps += cart.steps
+            
+            log.info(f"📦 Loaded {len(self.carts)} cartridges with {total_steps:,} total training steps")
     
     def spawn(self, tokens: List[int]) -> Cartridge:
         cart = Cartridge(self.stem, set(tokens))
@@ -751,10 +826,19 @@ class Engine:
         return ' '.join(words) if words else "[No output generated]"
     
     def save(self):
+        """Thread-safe save with full GPU synchronization"""
         self.registry.save(os.path.join(CFG.library, 'registry.json'))
-        for cart in self.carts.values():
-            cart.save(CFG.library)
-        log.info(f"Saved {len(self.carts)} cartridges")
+        
+        # Force all pending GPU operations to complete
+        mx.eval()
+        
+        with GPU_LOCK:
+            for cart in self.carts.values():
+                cart.save(CFG.library)
+        
+        # Final sync to ensure writes complete
+        mx.eval()
+        log.info(f"💾 Saved {len(self.carts)} cartridges")
 
 
 # =============================================================================
@@ -799,6 +883,41 @@ class State:
                 'training_mode': self.mode,
                 'recent_carts': list(self.recent_carts[-5:])  # Last 5 trained
             }
+    
+    def save(self):
+        """Persist training state to disk"""
+        with self.lock:
+            data = {
+                'step': self.step,
+                'paused': self.paused,
+                'mode': self.mode,
+                'last_save': time.time()
+            }
+        try:
+            tmp_path = CFG.state_file + '.tmp'
+            with open(tmp_path, 'w') as f:
+                json.dump(data, f)
+            Path(tmp_path).replace(CFG.state_file)  # Atomic write
+            log.debug(f"💾 State saved: step {self.step}")
+        except Exception as e:
+            log.error(f"State save failed: {e}")
+    
+    def load(self):
+        """Restore training state from disk"""
+        if not os.path.exists(CFG.state_file):
+            log.info("ℹ️  No saved state found, starting fresh")
+            return
+        
+        try:
+            with open(CFG.state_file) as f:
+                data = json.load(f)
+            with self.lock:
+                self.step = data.get('step', 0)
+                self.paused = data.get('paused', False)
+                self.mode = data.get('mode', 'gpu')
+            log.info(f"📂 State loaded: step {self.step}, mode {self.mode}")
+        except Exception as e:
+            log.warning(f"State load failed: {e}, using defaults")
 
 STATE = State()
 ENGINE: Optional[Engine] = None
@@ -861,7 +980,7 @@ def data_gen():
 # =============================================================================
 
 def training_loop():
-    global ENGINE
+    global ENGINE, TUNER
     log.info("Training loop started")
     
     gen = data_gen()
@@ -870,6 +989,8 @@ def training_loop():
     tokens_done = 0
     t0 = time.time()
     step_start = time.time()
+    consecutive_errors = 0
+    MAX_ERRORS = 5
     
     while True:
         try:
@@ -879,6 +1000,8 @@ def training_loop():
             
             batch_size = TUNER.batch
             target = batch_size * (CFG.seq_len + 1) * 2
+            
+            # Fill buffer (no GPU needed)
             while len(buf) < target:
                 text = next(gen)
                 toks = ENGINE.registry.add(text)
@@ -888,6 +1011,7 @@ def training_loop():
                 time.sleep(0.01)
                 continue
             
+            # Build batch
             batch = []
             idx = 0
             for _ in range(batch_size):
@@ -903,13 +1027,23 @@ def training_loop():
             
             np_batch = np.array(batch, dtype=np.int32)
             
+            # GPU work with lock
             with GPU_LOCK:
                 ENGINE.maybe_spawn(np_batch.flatten(), step)
                 loss, cid = ENGINE.train_step(np_batch)
+                mx.eval()  # Force sync inside lock
             
+            # Validate loss
             if not np.isfinite(loss):
+                consecutive_errors += 1
+                if consecutive_errors > 5:
+                    TUNER.on_error()
+                    consecutive_errors = 0
                 continue
             
+            consecutive_errors = 0
+            
+            # Update tuner
             step_time = time.time() - step_start
             TUNER.update(step_time)
             step_start = time.time()
@@ -917,14 +1051,16 @@ def training_loop():
             step += 1
             tokens_done += batch_size * CFG.seq_len
             
-            # Track recent cartridges
+            # Update state
             with STATE.lock:
                 STATE.active_cart = cid
+                STATE.batch_size = TUNER.batch
                 if cid not in STATE.recent_carts:
                     STATE.recent_carts.append(cid)
                     if len(STATE.recent_carts) > 20:
                         STATE.recent_carts.pop(0)
             
+            # Periodic updates
             if step % 10 == 0:
                 now = time.time()
                 elapsed = now - t0
@@ -946,7 +1082,6 @@ def training_loop():
                     STATE.num_carts = len(ENGINE.carts)
                     STATE.tok_per_sec = tps
                     STATE.vocab_size = len(ENGINE.registry.tokens)
-                    STATE.batch_size = TUNER.batch
                     STATE.memory_mb = mem_mb
                     STATE.memory_percent = mem_pct
                     STATE.cpu_percent = cpu_pct
@@ -955,8 +1090,18 @@ def training_loop():
                     tokens_done = 0
                     t0 = now
             
+            # Periodic state save
+            if step % 500 == 0:
+                try:
+                    STATE.save()
+                except Exception as e:
+                    log.error(f"Periodic state save error: {e}")
+            
             if step % CFG.save_interval == 0:
-                ENGINE.save()
+                try:
+                    ENGINE.save()
+                except Exception as e:
+                    log.error(f"Save error: {e}")
         
         except KeyboardInterrupt:
             log.info("Training interrupted")
@@ -965,7 +1110,21 @@ def training_loop():
         except Exception as e:
             log.error(f"Training error: {e}")
             traceback.print_exc()
-            time.sleep(1)
+            consecutive_errors += 1
+            
+            if consecutive_errors >= MAX_ERRORS:
+                log.critical("Too many errors, pausing training")
+                STATE.paused = True
+                if ENGINE:
+                    try:
+                        ENGINE.save()
+                    except Exception as save_err:
+                        log.error(f"Save failed during error recovery: {save_err}")
+                break
+            
+            # Reduce batch on any error
+            TUNER.on_error()
+            time.sleep(1.0)  # Longer delay
 
 
 def chat_loop():
@@ -1016,17 +1175,49 @@ def chat_loop():
 # FASTAPI SERVER
 # =============================================================================
 
-app = FastAPI(title="Infinite Cartridge System")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
-
-@app.on_event("startup")
-def startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup - Validate dependencies
+    log.info("🔍 Validating dependencies...")
+    log.info(f"✅ WebSockets: {websockets.__version__}")
+    log.info(f"✅ SSE Starlette: {sse_starlette.__version__}")
+    
+    # Load state before anything else
+    STATE.load()
+    
+    # Set device mode from saved state
+    mx.set_default_device(mx.cpu if STATE.mode == 'cpu' else mx.gpu)
+    
+    # Initialize engine
     global ENGINE
     ENGINE = Engine()
-    threading.Thread(target=training_loop, daemon=True, name="TrainingLoop").start()
-    threading.Thread(target=chat_loop, daemon=True, name="ChatLoop").start()
-    log.info("Server started on http://localhost:8000")
+    
+    training_thread = threading.Thread(target=training_loop, daemon=True, name="TrainingLoop")
+    chat_thread = threading.Thread(target=chat_loop, daemon=True, name="ChatLoop")
+    training_thread.start()
+    chat_thread.start()
+    
+    log.info("✅ Server started on http://localhost:8000")
+    log.info("📡 WebSocket endpoint: ws://localhost:8000/ws/chat")
+    yield
+    
+    # Shutdown
+    log.info("🛑 Shutting down...")
+    STATE.paused = True
+    
+    # Wait for current GPU operations to finish
+    with GPU_LOCK:
+        time.sleep(0.5)  # Let GPU operations complete
+    
+    # Save everything
+    STATE.save()  # Save training state
+    if ENGINE:
+        ENGINE.save()  # Save cartridges
+    
+    log.info("💾 Final save complete")
+
+app = FastAPI(title="Infinite Cartridge System", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
 @app.get("/")
@@ -1109,15 +1300,23 @@ def set_mode(mode: str):
 
 @app.websocket("/ws/chat")
 async def ws_chat(websocket: WebSocket):
+    client_ip = websocket.client.host if websocket.client else "unknown"
+    user_agent = websocket.headers.get("user-agent", "unknown")[:30]
+    
+    log.info(f"🌐 WebSocket ATTEMPT from {client_ip} | {user_agent}")
+    
     try:
         await websocket.accept()
-        log.info("WebSocket connected")
+        log.info(f"✅ WebSocket CONNECTED from {client_ip}")
     except Exception as e:
-        log.error(f"WebSocket accept failed: {e}")
+        log.error(f"❌ WebSocket ACCEPT FAILED: {e}")
         return
+    
     try:
         while True:
             data = await websocket.receive_json()
+            prompt_preview = data.get('prompt', '')[:40]
+            log.debug(f"💬 Message: '{prompt_preview}...'")
             
             # Clear stale responses
             while not STATE.resp_q.empty():
@@ -1128,26 +1327,27 @@ async def ws_chat(websocket: WebSocket):
             
             STATE.chat_q.put(data)
             
-            # NON-BLOCKING wait with async sleep
+            # Wait for response
             t0 = time.time()
             response = None
             while time.time() - t0 < 30:
                 try:
-                    response = STATE.resp_q.get_nowait()  # Non-blocking
+                    response = STATE.resp_q.get_nowait()
                     break
                 except:
-                    pass
-                await asyncio.sleep(0.1)  # Yield to event loop
+                    await asyncio.sleep(0.1)
             
             if response is None:
-                response = {"error": "Timeout waiting for response"}
+                response = {"error": "Timeout"}
+                log.warning(f"⏰ Timeout for {client_ip}")
             
             await websocket.send_json(response)
+            log.debug(f"📤 Response sent to {client_ip}")
             
     except WebSocketDisconnect:
-        log.info("WebSocket disconnected")
+        log.info(f"👋 DISCONNECTED from {client_ip}")
     except Exception as e:
-        log.error(f"WebSocket error: {e}")
+        log.error(f"💥 ERROR from {client_ip}: {e}")
         try:
             await websocket.send_json({"error": str(e)})
         except:
