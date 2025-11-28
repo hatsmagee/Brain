@@ -572,7 +572,17 @@ class Engine:
         
         ctx = self.context_emb(tokens)
         routed = self.router.route(ctx, k=1)
-        cart = self.carts.get(routed[0][0]) if routed else list(self.carts.values())[0]
+        if routed:
+            cart = self.carts.get(routed[0][0])
+        else:
+            cart = list(self.carts.values())[0] if self.carts else None
+        
+        if not cart:
+            return "[No cartridges available]"
+        
+        # Update active cartridge in state
+        with STATE.lock:
+            STATE.active_cart = cart.id
         
         out_ids = cart.generate(tokens, max_new=max_tokens)
         words = [self.registry.tokens[t] if t < len(self.registry.tokens) else '<unk>' for t in out_ids]
@@ -766,9 +776,16 @@ def chat_loop():
     while True:
         try:
             if not STATE.chat_q.empty():
-                req = STATE.chat_q.get_nowait()
+                try:
+                    req = STATE.chat_q.get_nowait()
+                except:
+                    time.sleep(0.01)
+                    continue
+                
+                # Pause training temporarily
+                was_paused = STATE.paused
                 STATE.paused = True
-                time.sleep(0.05)
+                time.sleep(0.1)  # Give training loop time to pause
                 
                 try:
                     prompt = req.get('prompt', '')
@@ -780,17 +797,23 @@ def chat_loop():
                     else:
                         context = prompt
                     
-                    response = ENGINE.generate(context, max_tokens=req.get('max_tokens', 30))
-                    STATE.resp_q.put({'text': response})
+                    if not context.strip():
+                        STATE.resp_q.put({'error': 'Empty prompt'})
+                    else:
+                        response = ENGINE.generate(context, max_tokens=req.get('max_tokens', 50))
+                        STATE.resp_q.put({'text': response})
                 except Exception as e:
                     log.error(f"Gen error: {e}")
+                    traceback.print_exc()
                     STATE.resp_q.put({'error': str(e)})
                 finally:
-                    STATE.paused = False
+                    # Restore previous pause state
+                    STATE.paused = was_paused
             
             time.sleep(0.01)
         except Exception as e:
             log.error(f"Chat error: {e}")
+            traceback.print_exc()
             time.sleep(0.1)
 
 
@@ -871,24 +894,42 @@ async def ws_chat(websocket: WebSocket):
         while True:
             data = await websocket.receive_json()
             
+            # Clear any old responses
             while not STATE.resp_q.empty():
-                STATE.resp_q.get()
+                try:
+                    STATE.resp_q.get_nowait()
+                except:
+                    pass
             
+            # Put request in queue
             STATE.chat_q.put(data)
             
+            # Wait for response with timeout
             t0 = time.time()
+            response = None
             while True:
                 if not STATE.resp_q.empty():
-                    await websocket.send_json(STATE.resp_q.get())
-                    break
+                    try:
+                        response = STATE.resp_q.get_nowait()
+                        break
+                    except:
+                        pass
                 if time.time() - t0 > 30:
-                    await websocket.send_json({"error": "Timeout"})
+                    response = {"error": "Timeout waiting for response"}
                     break
                 await asyncio.sleep(0.05)
+            
+            # Send response
+            if response:
+                await websocket.send_json(response)
     except WebSocketDisconnect:
         pass
     except Exception as e:
         log.error(f"WS error: {e}")
+        try:
+            await websocket.send_json({"error": str(e)})
+        except:
+            pass
 
 
 @app.get("/metrics")
