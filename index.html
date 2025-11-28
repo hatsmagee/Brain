@@ -145,6 +145,11 @@
             background: var(--bg-primary);
             border-left: 3px solid var(--accent-blue);
             border-radius: 4px;
+            transition: all 0.2s;
+        }
+        .cartridge-item.active {
+            border-left-color: var(--accent-green);
+            background: rgba(16, 185, 129, 0.1);
         }
 
         .loading { text-align: center; color: var(--text-muted); padding: 20px; }
@@ -153,6 +158,20 @@
             border-radius: 3px; overflow: hidden; margin-top: 5px;
         }
         .progress-fill { height: 100%; background: var(--accent-blue); transition: width 0.3s; }
+
+        /* Recent cartridges indicator */
+        .recent-carts {
+            display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px;
+        }
+        .recent-cart-badge {
+            padding: 4px 8px; border-radius: 4px; font-size: 11px;
+            background: var(--bg-primary); color: var(--text-muted);
+            font-family: monospace;
+        }
+        .recent-cart-badge.current {
+            background: var(--accent-green);
+            color: white;
+        }
     </style>
 </head>
 <body>
@@ -169,7 +188,7 @@
                 <button class="btn btn-warning" id="pauseBtn" onclick="pauseTraining()">Pause</button>
                 <button class="btn btn-secondary" id="resumeBtn" onclick="resumeTraining()">Resume</button>
                 <button class="btn" id="modeBtn" onclick="toggleTrainingMode()" style="background: #8b5cf6">
-                    <span id="modeText">CPU</span>
+                    <span id="modeText">GPU</span>
                 </button>
             </div>
         </div>
@@ -193,6 +212,7 @@
             <div class="card">
                 <h2>🎯 Cartridges</h2>
                 <div id="cartridgeSummary" class="loading">Loading...</div>
+                <div id="recentCarts" class="recent-carts"></div>
             </div>
 
             <div class="card chat-container">
@@ -200,7 +220,7 @@
                 <div class="chat-messages" id="chatMessages">
                     <div class="message assistant">
                         <div class="message-label">System</div>
-                        <div>System Initialized. Training loop active.</div>
+                        <div>System Initialized. Training loop active. Chat uses trained cartridges.</div>
                     </div>
                 </div>
                 <div class="chat-input-container">
@@ -224,18 +244,22 @@
     </div>
 
     <script>
-        const API_BASE = ''; // Use current origin
+        const API_BASE = '';
         let eventSource = null;
         let chatWebSocket = null;
         let isPaused = false;
-        let conversation = [];  // Track conversation history
+        let conversation = [];
+        let currentActiveCart = null;
 
-        // Utilities
-        const formatNumber = n => typeof n === 'number' ? (n >= 1000 ? (n/1000).toFixed(1)+'K' : n.toFixed(2)) : 'N/A';
+        const formatNumber = n => {
+            if (typeof n !== 'number' || isNaN(n)) return 'N/A';
+            if (n >= 1000000) return (n/1000000).toFixed(1) + 'M';
+            if (n >= 1000) return (n/1000).toFixed(1) + 'K';
+            return n.toFixed(2);
+        };
         const formatTime = t => t ? new Date(t * 1000).toLocaleTimeString() : 'N/A';
 
         function updateUI(data) {
-            // Status
             isPaused = data.is_paused;
             const dot = document.getElementById('statusDot');
             const txt = document.getElementById('statusText');
@@ -248,14 +272,14 @@
                 txt.textContent = 'Running';
             }
 
-            // Mode
-            document.getElementById('modeText').textContent = (data.training_mode || 'cpu').toUpperCase();
+            document.getElementById('modeText').textContent = (data.training_mode || 'gpu').toUpperCase();
             
-            // Metrics
+            currentActiveCart = data.active_cartridge;
+            
             document.getElementById('trainingMetrics').innerHTML = `
                 <div class="metric"><span class="metric-label">Step</span><span class="metric-value">${data.step || 0}</span></div>
-                <div class="metric"><span class="metric-label">Loss</span><span class="metric-value">${formatNumber(data.loss)}</span></div>
-                <div class="metric"><span class="metric-label">Active Cart</span><span class="metric-value">${data.active_cartridge || 'Init'}</span></div>
+                <div class="metric"><span class="metric-label">Loss</span><span class="metric-value" style="color: ${data.loss < 3 ? 'var(--accent-green)' : data.loss < 5 ? 'var(--accent-orange)' : 'var(--accent-red)'}">${formatNumber(data.loss)}</span></div>
+                <div class="metric"><span class="metric-label">Active Cart</span><span class="metric-value" style="font-family: monospace; color: var(--accent-purple)">${data.active_cartridge || 'Init'}</span></div>
             `;
 
             document.getElementById('performanceMetrics').innerHTML = `
@@ -267,15 +291,28 @@
             document.getElementById('systemMetrics').innerHTML = `
                 <div class="metric"><span class="metric-label">Memory</span><span class="metric-value">${formatNumber(data.memory_mb)} MB</span></div>
                 <div class="metric"><span class="metric-label">CPU</span><span class="metric-value">${formatNumber(data.cpu_percent)}%</span></div>
-                <div class="progress-bar"><div class="progress-fill" style="width: ${data.memory_percent}%"></div></div>
+                <div class="progress-bar"><div class="progress-fill" style="width: ${Math.min(100, data.memory_percent || 0)}%"></div></div>
             `;
+
+            // Show recent cartridges trained
+            const recentCarts = data.recent_carts || [];
+            if (recentCarts.length > 0) {
+                const recentHtml = recentCarts.map(cid => 
+                    `<span class="recent-cart-badge ${cid === currentActiveCart ? 'current' : ''}">${cid}</span>`
+                ).join('');
+                document.getElementById('recentCarts').innerHTML = recentHtml;
+            }
         }
 
         function startSSE() {
             eventSource = new EventSource(`${API_BASE}/stream/metrics`);
             eventSource.onmessage = (e) => {
-                const data = JSON.parse(e.data);
-                updateUI(data);
+                try {
+                    const data = JSON.parse(e.data);
+                    updateUI(data);
+                } catch(err) {
+                    console.error("SSE parse error:", err);
+                }
             };
             eventSource.onerror = () => {
                 eventSource.close();
@@ -288,31 +325,33 @@
                 const res = await fetch(`${API_BASE}/cartridges?detailed=true`);
                 const data = await res.json();
                 
-                // Update Summary
                 document.getElementById('cartridgeSummary').innerHTML = `
-                    <div class="metric"><span class="metric-label">Total</span><span class="metric-value highlight">${data.summary.total_cartridges}</span></div>
-                    <div class="metric"><span class="metric-label">Tokens</span><span class="metric-value">${formatNumber(data.summary.total_owned_tokens)}</span></div>
+                    <div class="metric"><span class="metric-label">Total Cartridges</span><span class="metric-value highlight">${data.summary.total_cartridges}</span></div>
+                    <div class="metric"><span class="metric-label">Total Tokens</span><span class="metric-value">${formatNumber(data.summary.total_owned_tokens)}</span></div>
                 `;
 
-                // Update List
                 const listHTML = data.cartridges.map(c => `
-                    <div class="cartridge-item">
-                        <div style="display:flex; justify-content:space-between; font-weight:600; color:var(--accent-blue)">
-                            <span>${c.id}</span>
+                    <div class="cartridge-item ${c.id === currentActiveCart ? 'active' : ''}">
+                        <div style="display:flex; justify-content:space-between; font-weight:600; color:${c.id === currentActiveCart ? 'var(--accent-green)' : 'var(--accent-blue)'}">
+                            <span style="font-family: monospace">${c.id}</span>
                             <span>${c.tokens} toks</span>
                         </div>
-                        <div style="font-size:12px; color:var(--text-muted)">Created: ${formatTime(c.created)}</div>
+                        <div style="font-size:12px; color:var(--text-muted); display:flex; justify-content:space-between; margin-top:4px">
+                            <span>Steps: ${c.train_steps}</span>
+                            <span>Loss: ${c.avg_loss !== null ? c.avg_loss.toFixed(2) : 'N/A'}</span>
+                            <span>Str: ${c.strength.toFixed(2)}</span>
+                        </div>
                     </div>
                 `).join('');
                 document.getElementById('cartridgesList').innerHTML = listHTML || '<div style="padding:10px">No cartridges spawned yet.</div>';
 
-                // Update Graph
                 drawRadial(data.cartridges);
 
-            } catch(e) { console.error("Cartridge refresh failed", e); }
+            } catch(e) { 
+                console.error("Cartridge refresh failed", e); 
+            }
         }
 
-        // Training Controls
         const pauseTraining = () => fetch(`${API_BASE}/training/pause`, {method: 'POST'});
         const resumeTraining = () => fetch(`${API_BASE}/training/resume`, {method: 'POST'});
         
@@ -322,23 +361,40 @@
             await fetch(`${API_BASE}/training/mode/${nextMode}`, {method: 'POST'});
         }
 
-        // Chat / WebSocket
         function connectChat() {
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             chatWebSocket = new WebSocket(`${protocol}//${window.location.host}/ws/chat`);
             
+            chatWebSocket.onopen = () => {
+                console.log("WebSocket connected");
+            };
+            
             chatWebSocket.onmessage = (event) => {
-                const data = JSON.parse(event.data);
-                if(data.error) {
-                    addMsg('System', data.error, 'system');
-                } else {
-                    addMsg('Assistant', data.text, 'assistant');
-                    // Add assistant response to conversation history
-                    conversation.push({role: 'assistant', content: data.text});
+                try {
+                    const data = JSON.parse(event.data);
+                    if(data.error) {
+                        addMsg('System', `Error: ${data.error}`, 'system');
+                    } else {
+                        let info = '';
+                        if (data.cartridge_count !== undefined) {
+                            info = ` [${data.cartridge_count} carts, ${data.vocab_size} vocab]`;
+                        }
+                        addMsg('Assistant', data.text + info, 'assistant');
+                        conversation.push({role: 'assistant', content: data.text});
+                    }
+                } catch(err) {
+                    console.error("WebSocket message parse error:", err);
                 }
             };
             
-            chatWebSocket.onclose = () => setTimeout(connectChat, 3000);
+            chatWebSocket.onclose = () => {
+                console.log("WebSocket closed, reconnecting...");
+                setTimeout(connectChat, 3000);
+            };
+            
+            chatWebSocket.onerror = (err) => {
+                console.error("WebSocket error:", err);
+            };
         }
 
         function addMsg(sender, text, type) {
@@ -354,15 +410,18 @@
             const input = document.getElementById('chatInput');
             const txt = input.value.trim();
             if(!txt) return;
+            
+            if (!chatWebSocket || chatWebSocket.readyState !== WebSocket.OPEN) {
+                addMsg('System', 'WebSocket not connected. Reconnecting...', 'system');
+                connectChat();
+                return;
+            }
 
             addMsg('You', txt, 'user');
-
-            // Add user message to conversation history
             conversation.push({role: 'user', content: txt});
 
-            // Send full conversation context
             chatWebSocket.send(JSON.stringify({
-                prompt: txt,  // For backward compatibility
+                prompt: txt,
                 conversation: conversation,
                 max_tokens: 50
             }));
@@ -372,7 +431,6 @@
 
         function handleChatKeyPress(e) { if(e.key === 'Enter') sendChatMessage(); }
 
-        // Canvas Visualization
         function drawRadial(cartridges) {
             const canvas = document.getElementById('cartridgeRadial');
             const ctx = canvas.getContext('2d');
@@ -381,48 +439,79 @@
             
             ctx.clearRect(0,0,w,h);
             
-            // Background
+            // Background circles
             ctx.strokeStyle = '#334155';
-            ctx.beginPath(); ctx.arc(cx, cy, 100, 0, Math.PI*2); ctx.stroke();
-            ctx.beginPath(); ctx.arc(cx, cy, 250, 0, Math.PI*2); ctx.stroke();
+            ctx.lineWidth = 1;
+            [100, 200, 300].forEach(r => {
+                ctx.beginPath();
+                ctx.arc(cx, cy, r, 0, Math.PI*2);
+                ctx.stroke();
+            });
 
-            if(!cartridges || cartridges.length === 0) return;
+            if(!cartridges || cartridges.length === 0) {
+                ctx.fillStyle = '#64748b';
+                ctx.font = '14px sans-serif';
+                ctx.textAlign = 'center';
+                ctx.fillText('No cartridges yet', cx, cy);
+                return;
+            }
 
             const angleStep = (Math.PI*2) / cartridges.length;
             const maxTok = Math.max(...cartridges.map(c => c.tokens)) || 1;
+            const maxSteps = Math.max(...cartridges.map(c => c.train_steps)) || 1;
 
             cartridges.forEach((c, i) => {
-                const angle = i * angleStep;
-                const len = 100 + (c.tokens / maxTok) * 200; // 100 to 300 radius
+                const angle = i * angleStep - Math.PI/2;
+                const len = 100 + (c.tokens / maxTok) * 200;
                 
                 const ex = cx + Math.cos(angle) * len;
                 const ey = cy + Math.sin(angle) * len;
 
-                ctx.strokeStyle = `hsl(${(i * 137.5) % 360}, 70%, 60%)`;
-                ctx.lineWidth = 2;
+                // Color based on training progress
+                const hue = (c.train_steps / maxSteps) * 120; // Green = more trained
+                const isActive = c.id === currentActiveCart;
+                
+                ctx.strokeStyle = isActive ? '#10b981' : `hsl(${hue}, 70%, 50%)`;
+                ctx.lineWidth = isActive ? 3 : 2;
                 ctx.beginPath();
                 ctx.moveTo(cx, cy);
                 ctx.lineTo(ex, ey);
                 ctx.stroke();
 
-                ctx.fillStyle = ctx.strokeStyle;
+                // Node
+                ctx.fillStyle = isActive ? '#10b981' : `hsl(${hue}, 70%, 50%)`;
                 ctx.beginPath();
-                ctx.arc(ex, ey, 4, 0, Math.PI*2);
+                ctx.arc(ex, ey, isActive ? 8 : 5, 0, Math.PI*2);
                 ctx.fill();
+
+                // Label
+                ctx.fillStyle = '#e2e8f0';
+                ctx.font = '10px monospace';
+                ctx.textAlign = 'center';
+                ctx.fillText(c.id.substring(0, 4), ex, ey - 12);
             });
             
-            // Center Hub
+            // Center hub
             ctx.fillStyle = '#1e293b';
-            ctx.beginPath(); ctx.arc(cx, cy, 20, 0, Math.PI*2); ctx.fill();
+            ctx.beginPath();
+            ctx.arc(cx, cy, 25, 0, Math.PI*2);
+            ctx.fill();
             ctx.strokeStyle = '#3b82f6';
-            ctx.lineWidth = 2; ctx.stroke();
+            ctx.lineWidth = 3;
+            ctx.stroke();
+            
+            ctx.fillStyle = '#e2e8f0';
+            ctx.font = 'bold 12px sans-serif';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText('STEM', cx, cy);
         }
 
-        // Init
         window.onload = () => {
             startSSE();
             connectChat();
-            setInterval(refreshCartridges, 5000); // Poll cartridges list
+            refreshCartridges();
+            setInterval(refreshCartridges, 3000);
         };
     </script>
 </body>
