@@ -976,13 +976,10 @@ def chat_loop():
         try:
             if not STATE.chat_q.empty():
                 try:
-                    req = STATE.chat_q.get(timeout=0.1)
-                except queue.Empty:
+                    req = STATE.chat_q.get_nowait()
+                except:
+                    time.sleep(0.02)
                     continue
-                
-                was_paused = STATE.paused
-                STATE.paused = True
-                time.sleep(0.1)
                 
                 try:
                     prompt = req.get('prompt', '')
@@ -990,7 +987,7 @@ def chat_loop():
                     
                     if conv:
                         parts = [f"{m.get('role', 'user')}: {m.get('content', '')}" for m in conv]
-                        context = ' '.join(parts[-3:])  # Last 3 messages for context
+                        context = ' '.join(parts[-3:])
                     else:
                         context = prompt
                     
@@ -998,7 +995,8 @@ def chat_loop():
                         STATE.resp_q.put({'error': 'Empty prompt'})
                     else:
                         max_tokens = req.get('max_tokens', 50)
-                        response = ENGINE.generate(context, max_tokens=max_tokens)
+                        with GPU_LOCK:
+                            response = ENGINE.generate(context, max_tokens=max_tokens)
                         STATE.resp_q.put({
                             'text': response,
                             'cartridge_count': len(ENGINE.carts),
@@ -1006,10 +1004,7 @@ def chat_loop():
                         })
                 except Exception as e:
                     log.error(f"Generation error: {e}")
-                    traceback.print_exc()
                     STATE.resp_q.put({'error': str(e)})
-                finally:
-                    STATE.paused = was_paused
             else:
                 time.sleep(0.02)
         except Exception as e:
