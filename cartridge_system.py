@@ -355,12 +355,12 @@ class Cartridge:
         with open(folder / 'meta.json', 'w') as f:
             json.dump({
                 'id': self.id, 
-                'tokens': list(self.tokens), 
+                'tokens': [int(t) for t in self.tokens],  # Convert numpy types to Python int
                 'created': self.created,
-                'steps': self.steps, 
-                'strength': self.strength,
-                'total_loss': self.total_loss,
-                'loss_count': self.loss_count
+                'steps': int(self.steps),  # Ensure steps is Python int
+                'strength': float(self.strength),
+                'total_loss': float(self.total_loss),
+                'loss_count': int(self.loss_count)  # Ensure loss_count is Python int
             }, f)
     
     @classmethod
