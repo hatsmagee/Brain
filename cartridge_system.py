@@ -778,18 +778,25 @@ class State:
     recent_carts: List[str] = field(default_factory=list)
     
     def metrics(self) -> dict:
+        def safe_float(v):
+            """Convert inf/NaN to None for JSON serialization"""
+            if isinstance(v, (int, float)):
+                if not np.isfinite(v):
+                    return None
+            return v
+        
         with self.lock:
             return {
                 'step': self.step, 
-                'loss': self.loss, 
+                'loss': safe_float(self.loss), 
                 'active_cartridge': self.active_cart,
-                'tok_per_sec': self.tok_per_sec, 
+                'tok_per_sec': safe_float(self.tok_per_sec), 
                 'num_cartridges': self.num_carts,
                 'vocab_size': self.vocab_size, 
                 'batch_size': self.batch_size,
-                'memory_mb': self.memory_mb, 
-                'memory_percent': self.memory_percent,
-                'cpu_percent': self.cpu_percent, 
+                'memory_mb': safe_float(self.memory_mb), 
+                'memory_percent': safe_float(self.memory_percent),
+                'cpu_percent': safe_float(self.cpu_percent), 
                 'is_paused': self.paused,
                 'training_mode': self.mode,
                 'recent_carts': list(self.recent_carts[-5:])  # Last 5 trained
