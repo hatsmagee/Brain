@@ -208,7 +208,7 @@
                 <h2>⚡ Performance</h2>
                 
                 <!-- New histogram canvas -->
-                <canvas id="tpsHistogram" width="300" height="100" 
+                <canvas id="tpsHistogram" width="300" height="120" 
                         style="background: var(--bg-primary); border-radius: 8px; margin: 10px 0;"></canvas>
                 
                 <!-- Tuner status -->
@@ -541,16 +541,32 @@
                 
                 ctx.clearRect(0, 0, w, h);
                 
-                if (!data.counts || data.counts.length === 0) return;
+                if (!data.counts || data.counts.length === 0) {
+                    // Draw placeholder text
+                    ctx.fillStyle = '#64748b';
+                    ctx.font = '12px sans-serif';
+                    ctx.textAlign = 'center';
+                    ctx.fillText('Collecting TPS data...', w/2, h/2);
+                    return;
+                }
+                
+                // Padding for labels
+                const paddingTop = 20;
+                const paddingBottom = 30;
+                const paddingLeft = 50;
+                const paddingRight = 10;
+                const chartW = w - paddingLeft - paddingRight;
+                const chartH = h - paddingTop - paddingBottom;
+                const chartY = paddingTop;
                 
                 // Draw bars
                 const maxCount = Math.max(...data.counts, 1);
-                const barWidth = w / data.counts.length;
+                const barWidth = chartW / data.counts.length;
                 
                 data.counts.forEach((count, i) => {
-                    const height = (count / maxCount) * (h - 15);
-                    const x = i * barWidth + 1;
-                    const y = h - height;
+                    const height = (count / maxCount) * chartH;
+                    const x = paddingLeft + i * barWidth + 1;
+                    const y = chartY + chartH - height;
                     
                     // Color based on bin position relative to mean
                     const isAboveMean = data.bins[i] > data.mean;
@@ -563,17 +579,61 @@
                     const minBin = Math.min(...data.bins);
                     const maxBin = Math.max(...data.bins);
                     if (maxBin > minBin) {
-                        const meanX = ((data.mean - minBin) / (maxBin - minBin)) * w;
+                        const meanX = paddingLeft + ((data.mean - minBin) / (maxBin - minBin)) * chartW;
                         ctx.strokeStyle = '#f59e0b';
                         ctx.lineWidth = 2;
                         ctx.setLineDash([5, 5]);
                         ctx.beginPath();
-                        ctx.moveTo(meanX, 0);
-                        ctx.lineTo(meanX, h);
+                        ctx.moveTo(meanX, chartY);
+                        ctx.lineTo(meanX, chartY + chartH);
                         ctx.stroke();
                         ctx.setLineDash([]);
+                        
+                        // Label mean line
+                        ctx.fillStyle = '#f59e0b';
+                        ctx.font = '10px sans-serif';
+                        ctx.textAlign = 'center';
+                        ctx.fillText('Mean', meanX, chartY - 5);
                     }
                 }
+                
+                // Draw X-axis labels (TPS range)
+                ctx.fillStyle = '#94a3b8';
+                ctx.font = '10px sans-serif';
+                ctx.textAlign = 'center';
+                if (data.bins.length > 0) {
+                    const minBin = Math.min(...data.bins);
+                    const maxBin = Math.max(...data.bins);
+                    // Label min and max
+                    ctx.fillText(Math.round(minBin).toLocaleString(), paddingLeft, h - 5);
+                    ctx.fillText(Math.round(maxBin).toLocaleString(), w - paddingRight, h - 5);
+                    // Label middle if there's space
+                    if (w > 200) {
+                        ctx.fillText(Math.round((minBin + maxBin) / 2).toLocaleString(), w / 2, h - 5);
+                    }
+                }
+                
+                // Draw Y-axis label (Frequency)
+                ctx.save();
+                ctx.translate(15, h / 2);
+                ctx.rotate(-Math.PI / 2);
+                ctx.fillStyle = '#94a3b8';
+                ctx.font = '11px sans-serif';
+                ctx.textAlign = 'center';
+                ctx.fillText('Frequency', 0, 0);
+                ctx.restore();
+                
+                // Draw X-axis label (TPS)
+                ctx.fillStyle = '#94a3b8';
+                ctx.font = '11px sans-serif';
+                ctx.textAlign = 'center';
+                ctx.fillText('TPS (Tokens/Second)', w / 2, h - 8);
+                
+                // Draw title
+                ctx.fillStyle = '#e2e8f0';
+                ctx.font = 'bold 12px sans-serif';
+                ctx.textAlign = 'left';
+                ctx.fillText('TPS Distribution', paddingLeft, 12);
                 
                 // Update status
                 const statusHtml = `
