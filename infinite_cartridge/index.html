@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Infinite Cartridge System - Dashboard</title>
+    <style>
+        :root {
+            --bg-primary: #0f172a;
+            --bg-secondary: #1e293b;
+            --bg-card: #1e293b;
+            --bg-card-hover: #334155;
+            --text-primary: #e2e8f0;
+            --text-secondary: #cbd5e1;
+            --text-muted: #94a3b8;
+            --accent-blue: #3b82f6;
+            --accent-purple: #8b5cf6;
+            --accent-green: #10b981;
+            --accent-orange: #f59e0b;
+            --accent-red: #ef4444;
+            --border-color: #334155;
+            --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.3);
+            --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.4);
+            --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.5);
+            --shadow-glow: 0 0 20px rgba(59, 130, 246, 0.3);
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #0f172a 100%);
+            background-attachment: fixed;
+            color: var(--text-primary);
+            min-height: 100vh;
+            padding: 20px;
+            line-height: 1.6;
+        }
+
+        .container { max-width: 1400px; margin: 0 auto; }
+
+        .header {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            padding: 24px 32px;
+            margin-bottom: 24px;
+            box-shadow: var(--shadow-md);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            backdrop-filter: blur(10px);
+        }
+
+        .header h1 {
+            font-size: 28px;
+            background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            font-weight: 700;
+        }
+
+        .status-indicator {
+            display: flex; align-items: center; gap: 10px;
+            color: var(--text-secondary); font-size: 14px; margin-top: 8px;
+        }
+
+        .status-dot {
+            width: 10px; height: 10px; border-radius: 50%;
+            background: var(--accent-green);
+            animation: pulse 2s infinite;
+            box-shadow: 0 0 10px var(--accent-green);
+        }
+        .status-dot.paused { background: var(--accent-orange); box-shadow: 0 0 10px var(--accent-orange); }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.7; transform: scale(1.1); }
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px; margin-bottom: 20px;
+        }
+
+        .card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            padding: 24px;
+            box-shadow: var(--shadow-md);
+            transition: all 0.3s ease;
+        }
+        .card:hover { transform: translateY(-4px); border-color: var(--accent-blue); }
+
+        .card h2 {
+            font-size: 18px; color: var(--text-primary);
+            margin-bottom: 20px; font-weight: 600;
+        }
+
+        .metric {
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 14px 0; border-bottom: 1px solid var(--border-color);
+        }
+        .metric:last-child { border-bottom: none; }
+        .metric-label { color: var(--text-muted); font-size: 14px; }
+        .metric-value { font-size: 18px; font-weight: 600; color: var(--text-primary); }
+        .metric-value.highlight { color: var(--accent-blue); font-size: 22px; }
+
+        .controls { display: flex; gap: 10px; }
+        .btn {
+            padding: 10px 20px; border: none; border-radius: 10px;
+            font-size: 14px; font-weight: 600; cursor: pointer;
+            transition: all 0.2s; flex: 1; color: white;
+        }
+        .btn:hover { transform: translateY(-2px); filter: brightness(110%); }
+        .btn-primary { background: var(--accent-blue); }
+        .btn-secondary { background: var(--accent-green); }
+        .btn-warning { background: var(--accent-orange); }
+
+        .chat-container { grid-column: 1 / -1; }
+        .chat-messages {
+            height: 300px; overflow-y: auto;
+            background: var(--bg-primary);
+            border: 1px solid var(--border-color);
+            border-radius: 12px; padding: 16px; margin-bottom: 16px;
+        }
+        .message { margin-bottom: 12px; padding: 14px; border-radius: 12px; max-width: 80%; }
+        .message.user { background: var(--accent-blue); margin-left: auto; }
+        .message.assistant { background: var(--bg-secondary); margin-right: auto; border: 1px solid var(--border-color); }
+        .message.system { background: transparent; color: var(--text-muted); font-size: 12px; width: 100%; text-align: center; }
+        .message-label { font-size: 10px; opacity: 0.7; margin-bottom: 4px; text-transform: uppercase; }
+
+        .chat-input-container { display: flex; gap: 10px; }
+        .chat-input {
+            flex: 1; padding: 12px 16px;
+            border: 1px solid var(--border-color); border-radius: 10px;
+            background: var(--bg-card); color: var(--text-primary);
+        }
+
+        .cartridges-list { max-height: 400px; overflow-y: auto; }
+        .cartridge-item {
+            padding: 10px; margin-bottom: 8px;
+            background: var(--bg-primary);
+            border-left: 3px solid var(--accent-blue);
+            border-radius: 4px;
+        }
+
+        .loading { text-align: center; color: var(--text-muted); padding: 20px; }
+        .progress-bar {
+            width: 100%; height: 6px; background: var(--bg-primary);
+            border-radius: 3px; overflow: hidden; margin-top: 5px;
+        }
+        .progress-fill { height: 100%; background: var(--accent-blue); transition: width 0.3s; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div>
+                <h1>🧠 Infinite Cartridge System</h1>
+                <div class="status-indicator">
+                    <span class="status-dot" id="statusDot"></span>
+                    <span id="statusText">Connecting...</span>
+                </div>
+            </div>
+            <div class="controls">
+                <button class="btn btn-warning" id="pauseBtn" onclick="pauseTraining()">Pause</button>
+                <button class="btn btn-secondary" id="resumeBtn" onclick="resumeTraining()">Resume</button>
+                <button class="btn" id="modeBtn" onclick="toggleTrainingMode()" style="background: #8b5cf6">
+                    <span id="modeText">CPU</span>
+                </button>
+            </div>
+        </div>
+
+        <div class="grid">
+            <div class="card">
+                <h2>📊 Training Metrics</h2>
+                <div id="trainingMetrics" class="loading">Waiting for stream...</div>
+            </div>
+
+            <div class="card">
+                <h2>⚡ Performance</h2>
+                <div id="performanceMetrics" class="loading">Waiting for stream...</div>
+            </div>
+
+            <div class="card">
+                <h2>💾 System Resources</h2>
+                <div id="systemMetrics" class="loading">Waiting for stream...</div>
+            </div>
+
+            <div class="card">
+                <h2>🎯 Cartridges</h2>
+                <div id="cartridgeSummary" class="loading">Loading...</div>
+            </div>
+
+            <div class="card chat-container">
+                <h2>💬 Chat Interface</h2>
+                <div class="chat-messages" id="chatMessages">
+                    <div class="message assistant">
+                        <div class="message-label">System</div>
+                        <div>System Initialized. Training loop active.</div>
+                    </div>
+                </div>
+                <div class="chat-input-container">
+                    <input type="text" class="chat-input" id="chatInput" placeholder="Ask something..." onkeypress="handleChatKeyPress(event)">
+                    <button class="btn btn-primary" onclick="sendChatMessage()">Send</button>
+                </div>
+            </div>
+
+            <div class="card" style="grid-column: 1 / -1;">
+                <h2>🎯 Cartridge Visualization</h2>
+                <div style="display: flex; justify-content: center; align-items: center; min-height: 500px;">
+                    <canvas id="cartridgeRadial" width="800" height="800"></canvas>
+                </div>
+            </div>
+
+            <div class="card" style="grid-column: 1 / -1;">
+                <h2>📦 Cartridge Registry</h2>
+                <div id="cartridgesList" class="cartridges-list loading">Loading...</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = ''; // Use current origin
+        let eventSource = null;
+        let chatWebSocket = null;
+        let isPaused = false;
+        let conversation = [];  // Track conversation history
+
+        // Utilities
+        const formatNumber = n => typeof n === 'number' ? (n >= 1000 ? (n/1000).toFixed(1)+'K' : n.toFixed(2)) : 'N/A';
+        const formatTime = t => t ? new Date(t * 1000).toLocaleTimeString() : 'N/A';
+
+        function updateUI(data) {
+            // Status
+            isPaused = data.is_paused;
+            const dot = document.getElementById('statusDot');
+            const txt = document.getElementById('statusText');
+            
+            if (isPaused) {
+                dot.classList.add('paused');
+                txt.textContent = 'Paused';
+            } else {
+                dot.classList.remove('paused');
+                txt.textContent = 'Running';
+            }
+
+            // Mode
+            document.getElementById('modeText').textContent = (data.training_mode || 'cpu').toUpperCase();
+            
+            // Metrics
+            document.getElementById('trainingMetrics').innerHTML = `
+                <div class="metric"><span class="metric-label">Step</span><span class="metric-value">${data.step || 0}</span></div>
+                <div class="metric"><span class="metric-label">Loss</span><span class="metric-value">${formatNumber(data.loss)}</span></div>
+                <div class="metric"><span class="metric-label">Active Cart</span><span class="metric-value">${data.active_cartridge || 'Init'}</span></div>
+            `;
+
+            document.getElementById('performanceMetrics').innerHTML = `
+                <div class="metric"><span class="metric-label">Tokens/sec</span><span class="metric-value highlight">${formatNumber(data.tok_per_sec)}</span></div>
+                <div class="metric"><span class="metric-label">Batch Size</span><span class="metric-value" style="color: var(--accent-purple);">${data.batch_size || 'N/A'}</span></div>
+                <div class="metric"><span class="metric-label">Vocab Size</span><span class="metric-value">${data.vocab_size || 0}</span></div>
+            `;
+
+            document.getElementById('systemMetrics').innerHTML = `
+                <div class="metric"><span class="metric-label">Memory</span><span class="metric-value">${formatNumber(data.memory_mb)} MB</span></div>
+                <div class="metric"><span class="metric-label">CPU</span><span class="metric-value">${formatNumber(data.cpu_percent)}%</span></div>
+                <div class="progress-bar"><div class="progress-fill" style="width: ${data.memory_percent}%"></div></div>
+            `;
+        }
+
+        function startSSE() {
+            eventSource = new EventSource(`${API_BASE}/stream/metrics`);
+            eventSource.onmessage = (e) => {
+                const data = JSON.parse(e.data);
+                updateUI(data);
+            };
+            eventSource.onerror = () => {
+                eventSource.close();
+                setTimeout(startSSE, 3000);
+            };
+        }
+
+        async function refreshCartridges() {
+            try {
+                const res = await fetch(`${API_BASE}/cartridges?detailed=true`);
+                const data = await res.json();
+                
+                // Update Summary
+                document.getElementById('cartridgeSummary').innerHTML = `
+                    <div class="metric"><span class="metric-label">Total</span><span class="metric-value highlight">${data.summary.total_cartridges}</span></div>
+                    <div class="metric"><span class="metric-label">Tokens</span><span class="metric-value">${formatNumber(data.summary.total_owned_tokens)}</span></div>
+                `;
+
+                // Update List
+                const listHTML = data.cartridges.map(c => `
+                    <div class="cartridge-item">
+                        <div style="display:flex; justify-content:space-between; font-weight:600; color:var(--accent-blue)">
+                            <span>${c.id}</span>
+                            <span>${c.tokens} toks</span>
+                        </div>
+                        <div style="font-size:12px; color:var(--text-muted)">Created: ${formatTime(c.created)}</div>
+                    </div>
+                `).join('');
+                document.getElementById('cartridgesList').innerHTML = listHTML || '<div style="padding:10px">No cartridges spawned yet.</div>';
+
+                // Update Graph
+                drawRadial(data.cartridges);
+
+            } catch(e) { console.error("Cartridge refresh failed", e); }
+        }
+
+        // Training Controls
+        const pauseTraining = () => fetch(`${API_BASE}/training/pause`, {method: 'POST'});
+        const resumeTraining = () => fetch(`${API_BASE}/training/resume`, {method: 'POST'});
+        
+        async function toggleTrainingMode() {
+            const current = document.getElementById('modeText').textContent.toLowerCase();
+            const nextMode = current === 'cpu' ? 'gpu' : 'cpu';
+            await fetch(`${API_BASE}/training/mode/${nextMode}`, {method: 'POST'});
+        }
+
+        // Chat / WebSocket
+        function connectChat() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            chatWebSocket = new WebSocket(`${protocol}//${window.location.host}/ws/chat`);
+            
+            chatWebSocket.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                if(data.error) {
+                    addMsg('System', data.error, 'system');
+                } else {
+                    addMsg('Assistant', data.text, 'assistant');
+                    // Add assistant response to conversation history
+                    conversation.push({role: 'assistant', content: data.text});
+                }
+            };
+            
+            chatWebSocket.onclose = () => setTimeout(connectChat, 3000);
+        }
+
+        function addMsg(sender, text, type) {
+            const div = document.createElement('div');
+            div.className = `message ${type}`;
+            div.innerHTML = `<div class="message-label">${sender}</div>${text}`;
+            const container = document.getElementById('chatMessages');
+            container.appendChild(div);
+            container.scrollTop = container.scrollHeight;
+        }
+
+        function sendChatMessage() {
+            const input = document.getElementById('chatInput');
+            const txt = input.value.trim();
+            if(!txt) return;
+
+            addMsg('You', txt, 'user');
+
+            // Add user message to conversation history
+            conversation.push({role: 'user', content: txt});
+
+            // Send full conversation context
+            chatWebSocket.send(JSON.stringify({
+                prompt: txt,  // For backward compatibility
+                conversation: conversation,
+                max_tokens: 50
+            }));
+
+            input.value = '';
+        }
+
+        function handleChatKeyPress(e) { if(e.key === 'Enter') sendChatMessage(); }
+
+        // Canvas Visualization
+        function drawRadial(cartridges) {
+            const canvas = document.getElementById('cartridgeRadial');
+            const ctx = canvas.getContext('2d');
+            const w = canvas.width, h = canvas.height;
+            const cx = w/2, cy = h/2;
+            
+            ctx.clearRect(0,0,w,h);
+            
+            // Background
+            ctx.strokeStyle = '#334155';
+            ctx.beginPath(); ctx.arc(cx, cy, 100, 0, Math.PI*2); ctx.stroke();
+            ctx.beginPath(); ctx.arc(cx, cy, 250, 0, Math.PI*2); ctx.stroke();
+
+            if(!cartridges || cartridges.length === 0) return;
+
+            const angleStep = (Math.PI*2) / cartridges.length;
+            const maxTok = Math.max(...cartridges.map(c => c.tokens)) || 1;
+
+            cartridges.forEach((c, i) => {
+                const angle = i * angleStep;
+                const len = 100 + (c.tokens / maxTok) * 200; // 100 to 300 radius
+                
+                const ex = cx + Math.cos(angle) * len;
+                const ey = cy + Math.sin(angle) * len;
+
+                ctx.strokeStyle = `hsl(${(i * 137.5) % 360}, 70%, 60%)`;
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                ctx.moveTo(cx, cy);
+                ctx.lineTo(ex, ey);
+                ctx.stroke();
+
+                ctx.fillStyle = ctx.strokeStyle;
+                ctx.beginPath();
+                ctx.arc(ex, ey, 4, 0, Math.PI*2);
+                ctx.fill();
+            });
+            
+            // Center Hub
+            ctx.fillStyle = '#1e293b';
+            ctx.beginPath(); ctx.arc(cx, cy, 20, 0, Math.PI*2); ctx.fill();
+            ctx.strokeStyle = '#3b82f6';
+            ctx.lineWidth = 2; ctx.stroke();
+        }
+
+        // Init
+        window.onload = () => {
+            startSSE();
+            connectChat();
+            setInterval(refreshCartridges, 5000); // Poll cartridges list
+        };
+    </script>
+</body>
+</html>
