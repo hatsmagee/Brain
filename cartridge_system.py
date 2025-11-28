@@ -284,6 +284,56 @@ class BatchTuner:
             "volatility": round(self.get_volatility() * 100, 1),
             "volatility_threshold": round(self.volatility_threshold * 100, 1)
         }
+    
+    def save(self, path: str = None):
+        """Persist tuner state to disk"""
+        if path is None:
+            path = os.path.join(CFG.library, 'tuner_state.json')
+        
+        data = {
+            'batch': self.batch,
+            'best_batch': self.best_batch,
+            'best_tps': self.best_tps,
+            'max_b': self.max_b,
+            'last_error_batch': self.last_error_batch,
+            'error_count': self.error_count,
+            'last_save': time.time()
+        }
+        
+        try:
+            tmp_path = path + '.tmp'
+            with open(tmp_path, 'w') as f:
+                json.dump(data, f)
+            Path(tmp_path).replace(path)  # Atomic write
+            log.debug(f"💾 BatchTuner state saved: batch={self.batch}, best={self.best_batch}")
+        except Exception as e:
+            log.error(f"BatchTuner save failed: {e}")
+    
+    def load(self, path: str = None):
+        """Restore tuner state from disk"""
+        if path is None:
+            path = os.path.join(CFG.library, 'tuner_state.json')
+        
+        if not os.path.exists(path):
+            log.debug("ℹ️  No saved BatchTuner state found, starting fresh")
+            return
+        
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            
+            # Restore critical state
+            self.batch = data.get('batch', self.batch)
+            self.best_batch = data.get('best_batch', self.best_batch)
+            self.best_tps = data.get('best_tps', 0.0)
+            self.max_b = data.get('max_b', self.max_b)
+            self.last_error_batch = data.get('last_error_batch', 999999)
+            self.error_count = data.get('error_count', 0)
+            
+            log.info(f"📂 BatchTuner loaded: batch={self.batch}, best={self.best_batch}, "
+                    f"best_tps={self.best_tps:.1f}, max={self.max_b}")
+        except Exception as e:
+            log.warning(f"BatchTuner load failed: {e}, using defaults")
 
 
 TUNER = BatchTuner(initial=8, min_b=8, max_b=256)
@@ -1391,6 +1441,7 @@ def training_loop():
             if step % 500 == 0:
                 try:
                     STATE.save()
+                    TUNER.save()  # Save tuner state periodically
                 except Exception as e:
                     log.error(f"Periodic state save error: {e}")
             
@@ -1482,6 +1533,9 @@ async def lifespan(app: FastAPI):
     # Load state before anything else
     STATE.load()
     
+    # Load BatchTuner state (must happen before engine initialization)
+    TUNER.load()
+    
     # Set device mode from saved state
     mx.set_default_device(mx.cpu if STATE.mode == 'cpu' else mx.gpu)
     
@@ -1508,6 +1562,7 @@ async def lifespan(app: FastAPI):
     
     # Save everything
     STATE.save()  # Save training state
+    TUNER.save()  # Save tuner state
     if ENGINE:
         ENGINE.save()  # Save cartridges
     
