@@ -651,6 +651,13 @@
             ctx.beginPath();
             ctx.arc(cx, cy, pulseRadius, 0, Math.PI*2);
             ctx.stroke();
+            
+            // Hub label
+            ctx.fillStyle = '#e2e8f0';
+            ctx.font = 'bold 12px sans-serif';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText('STEM', cx, cy);
         }
         
         // Add hover detection
