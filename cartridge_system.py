@@ -69,7 +69,6 @@ os.makedirs(CFG.library, exist_ok=True)
 
 class BatchTuner:
     """PID-style batch optimizer - finds max throughput"""
-    
     def __init__(self, initial: int = 8, min_b: int = 8, max_b: int = 512):
         self.batch = initial
         self.min_b = min_b
@@ -78,7 +77,7 @@ class BatchTuner:
         self.best_batch = initial
         self.explore_cooldown = 0
         self.direction = 1
-    
+
     def update(self, step_time: float) -> int:
         tps = (self.batch * CFG.seq_len) / max(step_time, 0.001)
         
@@ -100,7 +99,7 @@ class BatchTuner:
             self.batch = self.best_batch
         
         return self.batch
-    
+
     def status(self) -> dict:
         return {"current": self.batch, "best": self.best_batch, "best_tps": round(self.best_tps, 1)}
 
@@ -355,12 +354,12 @@ class Cartridge:
         with open(folder / 'meta.json', 'w') as f:
             json.dump({
                 'id': self.id, 
-                'tokens': [int(t) for t in self.tokens],  # Convert numpy types to Python int
+                'tokens': list(self.tokens), 
                 'created': self.created,
-                'steps': int(self.steps),  # Ensure steps is Python int
-                'strength': float(self.strength),
-                'total_loss': float(self.total_loss),
-                'loss_count': int(self.loss_count)  # Ensure loss_count is Python int
+                'steps': self.steps, 
+                'strength': self.strength,
+                'total_loss': self.total_loss,
+                'loss_count': self.loss_count
             }, f)
     
     @classmethod
@@ -778,25 +777,18 @@ class State:
     recent_carts: List[str] = field(default_factory=list)
     
     def metrics(self) -> dict:
-        def safe_float(v):
-            """Convert inf/NaN to None for JSON serialization"""
-            if isinstance(v, (int, float)):
-                if not np.isfinite(v):
-                    return None
-            return v
-        
         with self.lock:
             return {
                 'step': self.step, 
-                'loss': safe_float(self.loss), 
+                'loss': self.loss, 
                 'active_cartridge': self.active_cart,
-                'tok_per_sec': safe_float(self.tok_per_sec), 
+                'tok_per_sec': self.tok_per_sec, 
                 'num_cartridges': self.num_carts,
                 'vocab_size': self.vocab_size, 
                 'batch_size': self.batch_size,
-                'memory_mb': safe_float(self.memory_mb), 
-                'memory_percent': safe_float(self.memory_percent),
-                'cpu_percent': safe_float(self.cpu_percent), 
+                'memory_mb': self.memory_mb, 
+                'memory_percent': self.memory_percent,
+                'cpu_percent': self.cpu_percent, 
                 'is_paused': self.paused,
                 'training_mode': self.mode,
                 'recent_carts': list(self.recent_carts[-5:])  # Last 5 trained
@@ -880,7 +872,6 @@ def training_loop():
                 continue
             
             batch_size = TUNER.batch
-            
             target = batch_size * (CFG.seq_len + 1) * 2
             while len(buf) < target:
                 text = next(gen)
